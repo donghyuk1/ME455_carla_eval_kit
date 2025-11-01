@@ -1,0 +1,14 @@
+#!/bin/bash
+# carla_test_autopilot
+
+# --- initialize conda environment ---
+source ~/anaconda3/etc/profile.d/conda.sh  # adjust path if Miniconda
+conda activate carla_eval
+
+# --- add fsm implementation to PYTHONPATH
+export PYTHONPATH="/home/dongg/workspace/carla_eval_kit:$PYTHONPATH"
+
+
+# --- run CARLA leaderboard ---
+cd ~/workspace/carla_eval_kit
+./leaderboard/scripts/local_evaluation_auto_myauto.sh ../me405/carla ./
