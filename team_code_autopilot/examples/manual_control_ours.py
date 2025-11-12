@@ -132,6 +132,43 @@ try:
 except ImportError:
     raise RuntimeError('cannot import numpy, make sure numpy package is installed')
 
+import cv2
+
+# --- HD-map GT pipeline (reuse from datagen) ---
+import cv2
+import pickle
+
+from team_code_autopilot.utils import carla_vehicle_annotator as cva
+from team_code_autopilot.utils import gemap_annotator as ga
+from team_code_autopilot.utils import test_xodr as tx   # your OpenDRIVE waypoint extractor
+
+
+
+
+
+CAMERA_SETUPS = {
+    'RGB_1': {
+        'enabled': True,
+        'location': (0.5, 0.10, 2.2),
+        'rotation': (-8.0, 0.0, 0.0),
+    },
+    'RGB_2': {
+        'enabled': True,
+        'location': (0.5, -0.10, 2.2),
+        'rotation': (8.0, 0.0, 0.0),
+    },
+    'lidar_1': {
+        'enabled': True,
+        'location': (0.5, 0, 2.2),
+        'rotation': (0.0, 0.0, 0.0),
+    }
+}
+
+
+
+
+
+
 
 # ==============================================================================
 # -- Global functions ----------------------------------------------------------
@@ -150,6 +187,28 @@ def get_actor_display_name(actor, truncate=250):
     return (name[:truncate - 1] + u'\u2026') if len(name) > truncate else name
 
 
+# hd map helper function
+def _prepare_hdmap_points(world):
+    """
+    Extract per-road geometry arrays + index mappings once using your tx.extract_waypoints,
+    so we can filter with ga.filter_by_cameras each frame.
+    """
+    carla_map = world.get_map()
+    xodr_text = carla_map.to_opendrive()
+    # Returns arrays and index mapping arrays (as in your datagen)
+    center_pts, divider_pts, bound_pts, cross_pts, idxes = tx.extract_waypoints(xodr_text)
+    return (center_pts, divider_pts, bound_pts, cross_pts, idxes)
+# end of hd map helper function
+
+
+def create_camera_transform(config):
+    loc_x, loc_y, loc_z = config.get('location', (0.5, 0.0, 2.2))
+    rot_pitch, rot_yaw, rot_roll = config.get('rotation', (-8.0, 0.0, 0.0))
+    location = carla.Location(x=loc_x, y=loc_y, z=loc_z)
+    rotation = carla.Rotation(pitch=rot_pitch, yaw=rot_yaw, roll=rot_roll)
+    return carla.Transform(location, rotation)
+
+
 # ==============================================================================
 # -- World ---------------------------------------------------------------------
 # ==============================================================================
@@ -159,14 +218,41 @@ class World(object):
     def __init__(self, carla_world, hud, args):
         self.world = carla_world
         self.actor_role_name = args.rolename
+
+        # --- HD-map GT caches (filled if --hdmap-gt) ---
+
+        self.hdmap_enabled = getattr(args, 'hdmap_gt', False)
+        self.hd_center_pts = None
+        self.hd_divider_pts = None
+        self.hd_bound_pts = None
+        self.hd_cross_pts = None
+        self.hd_idxes = None
+        self.hdmap_vis_on = self.hdmap_enabled  # start ON if flag given
+        self.hdmap_save_dir = getattr(args, 'hdmap_gt_save_dir', None)
+        self.hdmap_max_dist = float(getattr(args, 'hdmap_gt_dist', 61.0))
+
+        # --- GT cam bundles (if any) ---
+        self.hd_camera_units = []      # list of dicts: {name, sensor, depth_sensor, dirs}
+        self._hd_cam_sensors = []      # flat list of spawned sensors for cleanup
+
         try:
             self.map = self.world.get_map()
+            if self.hdmap_enabled:
+                (self.hd_center_pts,
+                self.hd_divider_pts,
+                self.hd_bound_pts,
+                self.hd_cross_pts,
+                self.hd_idxes) = _prepare_hdmap_points(self.world)
+                if self.hdmap_save_dir:
+                    os.makedirs(self.hdmap_save_dir, exist_ok=True)
         except RuntimeError as error:
             print('RuntimeError: {}'.format(error))
             print('  The server could not send the OpenDRIVE (.xodr) file:')
             print('  Make sure it exists, has the same name of your town, and is correct.')
             sys.exit(1)
         self.hud = hud
+
+
         self.player = None
         self.collision_sensor = None
         self.lane_invasion_sensor = None
@@ -174,6 +260,10 @@ class World(object):
         self.imu_sensor = None
         self.radar_sensor = None
         self.camera_manager = None
+
+        if self.hdmap_enabled:
+            self._spawn_gt_cameras()
+
         self._weather_presets = find_weather_presets()
         self._weather_index = 0
         self._actor_filter = args.filter
@@ -183,6 +273,10 @@ class World(object):
         self.recording_enabled = False
         self.recording_start = 0
         self.constant_velocity_enabled = False
+
+        self._hdmap_request_save = False
+
+
 
     def restart(self):
         self.player_max_speed = 1.589
@@ -275,6 +369,151 @@ class World(object):
                 sensor.destroy()
         if self.player is not None:
             self.player.destroy()
+
+        # destroy GT cameras
+        for s in getattr(self, "_hd_cam_sensors", []):
+            if s is not None:
+                try:
+                    s.destroy()
+                except Exception:
+                    pass
+        self._hd_cam_sensors = []
+        self.hd_camera_units = []
+
+
+    def _hdmap_tick(self):
+        if not self.hdmap_enabled:
+            return
+
+        # --- 1) Get center/divider/bound/cross + idxes (precompute once, reuse) ---
+        if any(x is None for x in (self.hd_center_pts, self.hd_divider_pts, self.hd_bound_pts, self.hd_cross_pts, self.hd_idxes)):
+            (self.hd_center_pts,
+            self.hd_divider_pts,
+            self.hd_bound_pts,
+            self.hd_cross_pts,
+            self.hd_idxes) = _prepare_hdmap_points(self.world)
+
+        center_pts  = self.hd_center_pts
+        divider_pts = self.hd_divider_pts
+        bound_pts   = self.hd_bound_pts
+        cross_pts   = self.hd_cross_pts
+        idxes       = self.hd_idxes  # tuple/list: (center_idx, divider_idx, bound_idx, cross_idx)
+
+        # Active camera (use the one currently selected in CameraManager)
+        cam_actor = self.camera_manager.sensor
+        if cam_actor is None:
+            return
+
+        # Snapshot (for cva.snap_processing parity)
+        world_snapshot = self.world.get_snapshot()
+
+        # Ego / others via cva.snap_processing
+        try:
+            ego_snap = cva.snap_processing([self.player], world_snapshot)[0]
+        except Exception:
+            return
+        vehicles = [a for a in self.world.get_actors().filter('vehicle.*') if a.id != self.player.id]
+        walkers  = list(self.world.get_actors().filter('walker.*'))
+        vehicle_snaps = cva.snap_processing(vehicles, world_snapshot) if vehicles else []
+        walker_snaps  = cva.snap_processing(walkers,  world_snapshot) if walkers  else []
+
+        # --- 2) Filter points using ga.filter_by_cameras to obtain masks ---
+        center_mask  = np.zeros(len(center_pts),  dtype=bool)
+        divider_mask = np.zeros(len(divider_pts), dtype=bool)
+        bound_mask   = np.zeros(len(bound_pts),   dtype=bool)
+        cross_mask   = np.zeros(len(cross_pts),   dtype=bool)
+
+        center_mask, divider_mask, bound_mask, cross_mask = ga.filter_by_cameras(
+            camera=cam_actor,
+            ego_vehicle=ego_snap,
+            center_pts=center_pts,
+            divider_pts=divider_pts,
+            bound_pts=bound_pts,
+            cross_pts=cross_pts,
+            masks=(center_mask, divider_mask, bound_mask, cross_mask),
+            max_dist=self.hdmap_max_dist,
+            min_dist=0.1
+        )
+
+        # --- 3) Apply masks and group by polyline id (exactly like your datagen) ---
+        center_pts_gt  = [center_pts[center_mask][idxes[0][center_mask] == i]  for i in np.unique(idxes[0][center_mask])]
+        divider_pts_gt = [divider_pts[divider_mask][idxes[1][divider_mask] == i] for i in np.unique(idxes[1][divider_mask])]
+        bound_pts_gt   = [bound_pts[bound_mask][idxes[2][bound_mask] == i]     for i in np.unique(idxes[2][bound_mask])]
+        cross_pts_gt   = [cross_pts[cross_mask][idxes[3][cross_mask] == i]     for i in np.unique(idxes[3][cross_mask])]
+
+        # 3D bboxes (vehicles & walkers) like datagen
+        veh_bboxes3d  = ga.get_vehicle_bbox(ego_snap, vehicle_snaps, radius=self.hdmap_max_dist)
+        walk_bboxes3d = ga.get_vehicle_bbox(ego_snap, walker_snaps,  radius=self.hdmap_max_dist)
+
+
+        camera_units = self.hd_camera_units
+        if not camera_units:
+            return  # should not happen if spawn succeeded
+
+        self.hdmap_vis_on = True
+
+        # --- 4) Visualize masked GT values (same as datagen: pass masked arrays) ---
+        if self.hdmap_vis_on:
+            vis = ga.get_gemap_vis(
+                center_pts[center_mask],
+                divider_pts[divider_mask],
+                bound_pts[bound_mask],
+                cross_pts[cross_mask],
+                (veh_bboxes3d, walk_bboxes3d),
+                ego_snap,
+                camera_units
+            )
+            try:
+                cv2.imshow("HDMap_GT", vis)
+                cv2.waitKey(1)
+            except Exception:
+                pass
+
+    def _spawn_gt_cameras(self):
+        """Spawn two RGB cameras attached to ego to mirror datagen CAMERA_SETUPS and build camera_units."""
+        # cleanup previous if any (e.g., after restart)
+        for s in self._hd_cam_sensors:
+            try:
+                s.destroy()
+            except Exception:
+                pass
+        self._hd_cam_sensors.clear()
+        self.hd_camera_units.clear()
+
+        bp_lib = self.world.get_blueprint_library()
+
+        # match datagen resolution & tick
+        rgb_bp = bp_lib.find('sensor.camera.rgb')
+        rgb_bp.set_attribute('image_size_x', '1936')
+        rgb_bp.set_attribute('image_size_y', '1216')
+        rgb_bp.set_attribute('sensor_tick', '0.0')
+
+        # depth is NOT required for HD-map vis; create it only if you want parity
+        depth_bp = bp_lib.find('sensor.camera.depth')
+        depth_bp.set_attribute('image_size_x', '1936')
+        depth_bp.set_attribute('image_size_y', '1216')
+        depth_bp.set_attribute('sensor_tick', '0.0')
+
+        for name, cfg in CAMERA_SETUPS.items():
+            if not cfg.get('enabled', True):
+                continue
+            if not name.startswith('RGB'):
+                continue  # only need RGB cams for frustum filtering
+
+            tf = create_camera_transform(cfg)
+            cam = self.world.try_spawn_actor(rgb_bp, tf, attach_to=self.player)
+            if cam is None:
+                continue
+            # depth is optional; keep for API parity with datagen structures
+            depth = self.world.try_spawn_actor(depth_bp, tf, attach_to=self.player)
+
+            self._hd_cam_sensors.extend([cam] + ([depth] if depth else []))
+            self.hd_camera_units.append({
+                'name': name,
+                'sensor': cam,
+                'depth_sensor': depth,
+                'dirs': {}  # datagen fills I/O dirs; not needed here
+            })
 
 
 # ==============================================================================
@@ -1043,6 +1282,8 @@ def game_loop(args):
 
         hud = HUD(args.width, args.height)
         world = World(client.get_world(), hud, args)
+
+
         controller = KeyboardControl(world, args.autopilot)
 
         clock = pygame.time.Clock()
@@ -1052,6 +1293,10 @@ def game_loop(args):
                 return
             world.tick(clock)
             world.render(display)
+       
+            if getattr(world, "hdmap_enabled", False):
+                world._hdmap_tick()
+
             pygame.display.flip()
 
     finally:
@@ -1061,6 +1306,18 @@ def game_loop(args):
 
         if world is not None:
             world.destroy()
+
+        # try:
+        #     if 'hdmap_renderer' in locals() and hdmap_renderer:
+        #         hdmap_renderer.destroy()
+        # except Exception:
+        #     pass
+        # Also ensure OpenCV windows are closed if any remain
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
 
         pygame.quit()
 
@@ -1113,7 +1370,47 @@ def main():
         default=2.2,
         type=float,
         help='Gamma correction of the camera (default: 2.2)')
+    
+# --- HD map display options ---   
+    argparser.add_argument(
+        '--hdmap',
+        action='store_true',
+        help='show an OpenCV window with the HD map')
+    argparser.add_argument(
+        '--hdmap-size',
+        metavar='WIDTHxHEIGHT',
+        default='800x800',
+        help='HD map window size (default: 800x800)')
+    argparser.add_argument(
+        '--hdmap-save',
+        metavar='DIR',
+        default=None,
+        help='optional directory to save HD map frames (PNG)')
+# ------------------------------
+
+# --- HD map gt pipeline options ---
+    argparser.add_argument(
+        '--hdmap-gt', action='store_true',
+        help='enable GT HD-map pipeline (cva/ga/tx) and live CV2 window')
+    argparser.add_argument(
+        '--hdmap-gt-dist', type=float, default=61.0,
+        help='max ego-centric distance for HD-map masks/bboxes (default: 61m)')
+    argparser.add_argument(
+        '--hdmap-gt-step', type=float, default=1.0,
+        help='sampling step for waypoints grouping (kept for parity; not always used)')
+    argparser.add_argument(
+        '--hdmap-gt-save-dir', default=None,
+        help='directory to save HD-map vis (.png) and GT bundle (.pkl) when pressing F3')
+# ------------------------------
+
+
+
     args = argparser.parse_args()
+    try:
+        mw, mh = [int(x) for x in args.hdmap_size.split('x')]
+    except Exception:
+        mw, mh = 800, 800
+    args.hdmap_w, args.hdmap_h = mw, mh
 
     args.width, args.height = [int(x) for x in args.res.split('x')]
 
