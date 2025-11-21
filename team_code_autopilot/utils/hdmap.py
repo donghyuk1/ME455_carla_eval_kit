@@ -5,18 +5,38 @@
 # Imports
 # -----------------------------------------------------------------------------
 
-# TODO : fill in the imports
-
-
 import os
+import math
 import weakref
 from typing import Optional, Tuple, List
 import numpy as np
 import carla
+import cv2
 
 import team_code_autopilot.utils.test_xodr as tx
 import team_code_autopilot.utils.carla_vehicle_annotator as cva
 import team_code_autopilot.utils.gemap_annotator as ga
+from team_code_autopilot.utils.astar_planner import AStarPlanner  # ensure it's available
+
+# ---------- Camera setups (same as data_label_generate_ours.py) ----------
+CAMERA_SETUPS = {
+    'RGB_1': {
+        'enabled': True,
+        'location': (0.5,  0.10, 2.2),
+        'rotation': (-8.0, 0.0, 0.0),
+    },
+    'RGB_2': {
+        'enabled': True,
+        'location': (0.5, -0.10, 2.2),
+        'rotation': (-8.0, 0.0, 0.0),
+    },
+    'lidar_1': {
+        'enabled': True,
+        'location': (0.5, 0.0, 2.2),
+        'rotation': (0.0, 0.0, 0.0),
+    }
+}
+
 
 
 
@@ -31,43 +51,60 @@ class HDMap:
         host: str,
         port: int,
         role: str,
-        global_waypoints: np.ndarray,
         *,
         cam_res: Tuple[int, int] = (640, 400),
         frustum_max_dist: float = 61.0,
         sensor_tick: float = 0.0,
+        is_visualize: bool = True,
     ):
-        """
-        Args:
-          host/port       : CARLA server
-          role            : role_name to identify ego (e.g. "hero")
-          global_waypoints: (N,2) or (N,3) array of sparse path points (x,y[,z])
-          cam_res         : RGB sensor resolution used for frustum filtering
-          frustum_max_dist: max mask distance (meters)
-          sensor_tick     : camera update tick (0.0 = every world tick)
-        """
         self.client = carla.Client(host, port)
         self.client.set_timeout(5.0)
         self.world: carla.World = self.client.get_world()
         self.map: carla.Map = self.world.get_map()
 
         self.role = role
-        self.global_waypoints = np.asarray(global_waypoints, dtype=float)
-        if self.global_waypoints.shape[1] == 2:
-            # Add z=0 if not supplied
-            self.global_waypoints = np.hstack([self.global_waypoints, np.zeros((len(self.global_waypoints), 1))])
 
         self.w, self.h = cam_res
         self.max_dist = float(frustum_max_dist)
         self.sensor_tick = float(sensor_tick)
+        self.is_visualize = bool(is_visualize)
+        self.use_masked_points = False  # whether to filter hdmap points by frustum masks
+
+        if self.is_visualize:
+            cv2.namedWindow("HDMap_Debug", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("HDMap_Debug", 800, 800)
 
         # Ego and camera
-        self.ego: Optional[carla.Actor] = self._find_ego_by_role(self.world, self.role)
-        self._cam_ref: Optional[weakref.ReferenceType] = None
-        if self.ego:
-            cam = self._spawn_rgb(self.world, self.ego, self.w, self.h, self.sensor_tick)
-            if cam:
-                self._cam_ref = weakref.ref(cam)
+        # self.is_ego_ready = False
+        # self.ego: Optional[carla.Actor] = self._find_ego_by_role(self.world, self.role)
+        # if(self.ego is not None):
+        #     self.is_ego_ready = True
+        self.ego: Optional[carla.Actor] = None
+        self.camera_units = []
+        self.sensors = []  # for cleanup
+
+        # # RGB sensors (we only need RGB_1, RGB_2 for gemap_vis; lidar_1는 생략 가능)
+        # for cam_name, cam_cfg in CAMERA_SETUPS.items():
+        #     if not cam_cfg.get('enabled', True):
+        #         continue
+        #     if not cam_name.startswith('RGB'):
+        #         continue  # lidar는 HD map vis에는 필요 없음 (원하면 따로 추가 가능)
+
+        #     loc = cam_cfg.get('location', (0.5, 0.0, 2.2))
+        #     rot = cam_cfg.get('rotation', (-8.0, 0.0, 0.0))
+
+        #     sensor = self._spawn_rgb(self.world, self.ego, self.w, self.h, loc=loc, rot=rot, sensor_tick=self.sensor_tick)
+        #     if sensor is None:
+        #         print(f"[hdmap_vis] Failed to spawn {cam_name}")
+        #         continue
+
+        #     self.sensors.append(sensor)
+        #     self.camera_units.append({
+        #         'name': cam_name,
+        #         'sensor': sensor,
+        #         'depth_sensor': None,  # datagen에서는 depth도 있지만 여기서는 불필요
+        #         'dirs': {}
+        #     })
 
         # Parsed OpenDRIVE polylines (static)
         self.center_pts: Optional[np.ndarray] = None
@@ -89,17 +126,45 @@ class HDMap:
         self._vehicle_snaps = []
         self._walker_snaps = []
 
-        # Waypoint cursor (for simple “next” logic)
-        self._wp_idx = 0
+        # ---------- NEW: A* + route endpoints only ----------
+        from team_code_autopilot.utils.astar_planner import AStarPlanner
+
+        self._AStarPlannerClass = AStarPlanner  # just store the class
+        self._astar_planner: Optional[AStarPlanner] = None
+        self._astar_neighbor_radius: float = 4.0  # meters
+
+        # endpoints in world frame (x, y, z)
+        self._curr_wp_world: Optional[np.ndarray] = None
+        self._next_wp_world: Optional[np.ndarray] = None
+
+        # last endpoints used to build the path (for change detection)
+        self._last_curr_wp_world: Optional[np.ndarray] = None
+        self._last_next_wp_world: Optional[np.ndarray] = None
+
+        # A* output: centerline path between curr_wp and next_wp
+        self._local_center_path: Optional[np.ndarray] = None  # (M, 3)
+        self._local_center_path_progress: int = 0
+
+        # projection / validity flags
+        self._projection_max_dist: float = 10.0  # m
+        self._projection_ok: bool = False
+        self._path_valid: bool = False
+
+
 
     def __del__(self):
-        # Best-effort sensor cleanup
         try:
             cam = self._cam_ref() if self._cam_ref else None
             if cam and cam.is_alive:
                 cam.destroy()
         except Exception:
             pass
+
+        if self.is_visualize:
+            try:
+                cv2.destroyWindow("HDMap_Debug")
+            except Exception:
+                pass
 
 
 
@@ -132,46 +197,57 @@ class HDMap:
             return None
 
 
-    def _update_hdmap_info(self):
-        # Update internal map informations
-        # Update the HDmap features : self.center_pts, self.divider_pts, self.bound_pts, self.cross_pts, self.idxes
-        # Update the HDmap masks : 
-     
-        center_pts, divider_pts, bound_pts, cross_pts, idxes = self._prepare_hdmap_points(self.world)
-
-        center_mask, divider_mask, bound_mask, cross_mask = ga.filter_by_cameras(
-            camera=camera_actor,
-            ego_vehicle=ego_snap,
-            center_pts=center_pts,
-            divider_pts=divider_pts,
-            bound_pts=bound_pts,
-            cross_pts=cross_pts,
-            masks=(center_mask, divider_mask, bound_mask, cross_mask),
-            max_dist=args.dist,
-            min_dist=0.1
-        )
-
-        pass
-        
-
     def _prepare_hdmap_points(self):
-        """Parse the map's OpenDRIVE once and cache polylines + indices."""
         xodr = self.map.to_opendrive()
-        center_pts, divider_pts, bound_pts, cross_pts, idxes = tx.extract_waypoints(xodr)
-        # Ensure np arrays (N,3) float
-        def _as3(a):
-            a = np.asarray(a, dtype=float)
-            if a.ndim == 1:
-                a = a.reshape(1, -1)
-            if a.shape[1] == 2:
-                a = np.hstack([a, np.zeros((len(a), 1))])
-            return a
+        self.center_pts, self.divider_pts, self.bound_pts, self.cross_pts, self.idxes = tx.extract_waypoints(xodr)
+    
 
-        self.center_pts = _as3(center_pts)
-        self.divider_pts = _as3(divider_pts)
-        self.bound_pts = _as3(bound_pts)
-        self.cross_pts = _as3(cross_pts)
-        self.idxes = idxes  # expected tuple/list of index arrays
+    def _reacquire_ego_and_cameras_if_needed(self) -> bool:
+        """
+        Find ego by role_name if needed, and spawn RGB cameras once ego exists.
+        Returns True if ego & cameras are ready, False otherwise.
+        """
+        # 1) Find ego if missing or dead
+        if self.ego is None or not self.ego.is_alive:
+            self.ego = self._find_ego_by_role(self.world, self.role)
+            if self.ego is None:
+                self.is_ego_ready = False
+                return False
+
+        # 2) Spawn cameras once (when we first have a valid ego)
+        if not self.camera_units:
+            for cam_name, cam_cfg in CAMERA_SETUPS.items():
+                if not cam_cfg.get('enabled', True):
+                    continue
+                if not cam_name.startswith('RGB'):
+                    continue
+
+                loc = cam_cfg.get('location', (0.5, 0.0, 2.2))
+                rot = cam_cfg.get('rotation', (-8.0, 0.0, 0.0))
+
+                sensor = self._spawn_rgb(
+                    self.world,
+                    self.ego,
+                    self.w,
+                    self.h,
+                    sensor_tick=self.sensor_tick,
+                    loc=loc,
+                    rot=rot,
+                )
+                if sensor is None:
+                    print(f"[HDMap] Failed to spawn {cam_name}")
+                    continue
+
+                self.sensors.append(sensor)
+                self.camera_units.append({
+                    'name': cam_name,
+                    'sensor': sensor,
+                    'depth_sensor': None,
+                    'dirs': {},
+                })
+
+        self.is_ego_ready = True
+        return True
 
 
     @staticmethod
@@ -182,18 +258,6 @@ class HDMap:
                 return a
         return None
     
-
-    def _reacquire_ego_and_camera_if_needed(self):
-        """If ego or camera died/respawned (e.g., Backspace), re-find and re-attach."""
-        if self.ego is None or not self.ego.is_alive:
-            self.ego = self._find_ego_by_role(self.world, self.role)
-
-        cam = self._cam_ref() if self._cam_ref else None
-        if (self.ego is not None) and (cam is None or not cam.is_alive):
-            cam = self._spawn_rgb(self.world, self.ego, self.w, self.h, self.sensor_tick)
-            if cam:
-                self._cam_ref = weakref.ref(cam)
-
 
     @staticmethod
     def _dist2(a: np.ndarray, b: np.ndarray) -> float:
@@ -242,14 +306,21 @@ class HDMap:
           - camera-based frustum masks for center/divider/bound/cross
         """
         # 1) Keep ego/cam valid
-        self._reacquire_ego_and_camera_if_needed()
-        cam = self._cam_ref() if self._cam_ref else None
-        if self.ego is None or cam is None:
-            # Still not ready; skip this tick gracefully
+        # if self.ego is None:
+        #     # Still not ready; skip this tick gracefully
+        #     self.ego: Optional[carla.Actor] = self._find_ego_by_role(self.world, self.role)
+        #     if self.ego is None:
+        #         self.is_ego_ready = False
+        #         raise RuntimeError("Ego vehicle not found")
+        
+        # 1) Keep ego & cameras valid; if not ready, skip this tick gracefully
+        if not self._reacquire_ego_and_cameras_if_needed():
             return
 
+
         # 2) Sync to the world tick (non-blocking-ish)
-        snapshot = self.world.wait_for_tick(0.5)
+        # snapshot = self.world.wait_for_tick(2.0)
+        snapshot = self.world.get_snapshot()
         if snapshot is None:
             return
 
@@ -280,23 +351,35 @@ class HDMap:
         bound_mask = np.zeros(len(self.bound_pts), dtype=bool)
         cross_mask = np.zeros(len(self.cross_pts), dtype=bool)
 
-        center_mask, divider_mask, bound_mask, cross_mask = ga.filter_by_cameras(
-            camera=cam,
-            ego_vehicle=ego_snap,
-            center_pts=self.center_pts,
-            divider_pts=self.divider_pts,
-            bound_pts=self.bound_pts,
-            cross_pts=self.cross_pts,
-            masks=(center_mask, divider_mask, bound_mask, cross_mask),
-            max_dist=self.max_dist,
-            min_dist=0.1,
-        )
+
+        for unit in self.camera_units:
+            if not unit['name'].startswith('RGB'):
+                continue
+            cam_actor = unit['sensor']
+            if cam_actor is None or not cam_actor.is_alive:
+                continue
+            center_mask, divider_mask, bound_mask, cross_mask = ga.filter_by_cameras(
+                camera=cam_actor,
+                ego_vehicle=ego_snap,
+                center_pts=self.center_pts,
+                divider_pts=self.divider_pts,
+                bound_pts=self.bound_pts,
+                cross_pts=self.cross_pts,
+                masks=(center_mask, divider_mask, bound_mask, cross_mask),
+                max_dist=self.max_dist,
+                min_dist=0.1
+            )
 
         self.center_mask = center_mask
         self.divider_mask = divider_mask
         self.bound_mask = bound_mask
         self.cross_mask = cross_mask
 
+        if self.use_masked_points:
+            self.center_pts = self.center_pts[self.center_mask] if self.center_pts is not None else self.center_pts
+            self.divider_pts = self.divider_pts[self.divider_mask] if self.divider_pts is not None else self.divider_pts
+            self.bound_pts = self.bound_pts[self.bound_mask] if self.bound_pts is not None else self.bound_pts
+            self.cross_pts = self.cross_pts[self.cross_mask] if self.cross_pts is not None else self.cross_pts
 
     def _update_waypoint_cursor(self):
         """Maintain a simple forward-moving cursor along global sparse waypoints."""
@@ -315,6 +398,242 @@ class HDMap:
                 self._wp_idx = idx
 
 
+    def _ensure_astar_planner(self):
+        """Lazily create A* planner over center_pts XY."""
+        if self._astar_planner is not None:
+            return
+
+        if self.center_pts is None or len(self.center_pts) == 0:
+            self._prepare_hdmap_points()
+
+        if self.center_pts is None or len(self.center_pts) == 0:
+            return
+
+        # center_xy = self.center_pts[:, :2].astype(np.float32)
+        center_xy = self.center_pts[:, :2].astype(np.float32) 
+        self._astar_planner = self._AStarPlannerClass(
+            points=center_xy,
+            neighbor_radius=self._astar_neighbor_radius,
+            heuristic_weight=2.0,
+        )
+
+
+    def _project_to_center_idx(self, wp_xy: np.ndarray) -> Tuple[int, float]:
+        """
+        Project a world waypoint (x,y) to the nearest center_pts node.
+
+        Returns:
+            (idx, dist) where idx is index into self.center_pts, dist in meters.
+            If center_pts is empty, returns (-1, inf).
+        """
+        if self.center_pts is None or len(self.center_pts) == 0:
+            print("[HDMap] Warning: center_pts is empty; cannot project waypoint.")
+            return -1, float("inf")
+
+        center_xy = self.center_pts[:, :2]  # (N, 2)
+        diff = center_xy - wp_xy[None, :]
+        d2 = np.einsum("ij,ij->i", diff, diff)
+        k = int(np.argmin(d2))
+        d = float(np.sqrt(d2[k]))
+        return k, d
+    
+
+    def _make_hdmap_image_ego(
+        self,
+        center_pts: np.ndarray,
+        divider_pts: np.ndarray,
+        bound_pts: np.ndarray,
+        cross_pts: np.ndarray,
+        ego_snap,
+        img_size=(800, 800),
+        pixels_per_meter: float = 4.0,
+        curr_wp_world: Optional[np.ndarray] = None, # adding waypoint features
+        next_wp_world: Optional[np.ndarray] = None, # adding waypoint features
+        path_pts: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Create an ego-centered HD map image, similar to simple_hdmap_image()
+        in hdmap_vis.py.
+
+        - center_pts, divider_pts, bound_pts, cross_pts: (N,3) arrays in world frame.
+        - ego_snap: cva.snap_processing(...) result for ego
+        - img_size: output image size (h, w)
+        - pixels_per_meter: scaling of meters -> pixels
+        """
+        h, w = img_size
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+
+        # Ego pose from snap
+        ego_tf = ego_snap.get_transform()
+        ego_loc = ego_tf.location
+        ego_rot = ego_tf.rotation
+
+        ego_x = ego_loc.x
+        ego_y = ego_loc.y
+        ego_yaw = math.radians(ego_rot.yaw)
+
+        cos_yaw = math.cos(ego_yaw)
+        sin_yaw = math.sin(ego_yaw)
+
+        # Image center == ego position
+        cx = w // 2
+        cy = h // 2
+
+        def world_to_ego_pixel(x, y):
+            # 1) world -> ego frame (Y_body forward, X_body left)
+            dx = x - ego_x
+            dy = y - ego_y
+
+            Y_body =  cos_yaw * dx + sin_yaw * dy   # forward(+)
+            X_body = -sin_yaw * dx + cos_yaw * dy   # left(+)
+
+            # 2) ego -> pixel
+            ix = int(round(cx + X_body * pixels_per_meter))
+            iy = int(round(cy - Y_body * pixels_per_meter))  # forward => up
+            return ix, iy
+
+        def draw_points(pts, color, radius=1):
+            if pts is None or len(pts) == 0:
+                return
+            pts = np.asarray(pts)
+            xs = pts[:, 0]
+            ys = pts[:, 1]
+            for x, y in zip(xs, ys):
+                ix, iy = world_to_ego_pixel(x, y)
+                if 0 <= ix < w and 0 <= iy < h:
+                    cv2.circle(img, (ix, iy), radius, color, -1)
+
+        def draw_polyline(pts, color, thickness=2):
+            """Draw a polyline in ego-centered image for world-frame pts."""
+            if pts is None or len(pts) < 2:
+                return
+            pts = np.asarray(pts)
+            xs = pts[:, 0]
+            ys = pts[:, 1]
+            prev_px = None
+            for x, y in zip(xs, ys):
+                ix, iy = world_to_ego_pixel(x, y)
+                if 0 <= ix < w and 0 <= iy < h:
+                    if prev_px is not None:
+                        cv2.line(img, prev_px, (ix, iy), color, thickness)
+                    prev_px = (ix, iy)
+                else:
+                    prev_px = None  # break the polyline if out of frame
+
+        # Colors
+        color_center  = (0, 255, 255)  # centerline
+        color_divider = (0, 255, 0)    # lane divider
+        color_bound   = (255, 255, 0)  # road boundary
+        color_cross   = (255, 0, 255)  # crosswalk
+
+        # Draw layers
+        draw_points(center_pts,  color_center,  radius=1)
+        draw_points(divider_pts, color_divider, radius=1)
+        draw_points(bound_pts,   color_bound,   radius=1)
+        draw_points(cross_pts,   color_cross,   radius=1)
+
+        # Ego marker at center
+        cv2.circle(img, (cx, cy), 3, (0, 0, 255), -1)
+        cv2.putText(img, "EGO", (cx + 5, cy - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+
+        # ----- Optional: draw current & next global waypoints -----
+        # curr_wp_world in RED
+        if curr_wp_world is not None:
+            curr_wp_world = np.asarray(curr_wp_world, dtype=float).reshape(-1)
+            ix, iy = world_to_ego_pixel(curr_wp_world[0], curr_wp_world[1])
+            if 0 <= ix < w and 0 <= iy < h:
+                cv2.circle(img, (ix, iy), 6, (0, 0, 255), -1)
+                cv2.putText(img, "C", (ix + 4, iy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+        # next_wp_world in GREEN
+        if next_wp_world is not None:
+            next_wp_world = np.asarray(next_wp_world, dtype=float).reshape(-1)
+            ix, iy = world_to_ego_pixel(next_wp_world[0], next_wp_world[1])
+            if 0 <= ix < w and 0 <= iy < h:
+                cv2.circle(img, (ix, iy), 6, (0, 255, 0), -1)
+                cv2.putText(img, "N", (ix + 4, iy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        if path_pts is not None and len(path_pts) > 1:
+            # path_pts is expected to be (M, 3) in world coords (self._local_center_path)
+            draw_polyline(path_pts, color=(255, 0, 0), thickness=2)
+        else:
+            print("No path_pts to draw in HD map image.")
+
+
+        return img
+
+
+    def _draw_hdmap_debug(self):
+        """
+        Visualize current HD-map in an ego-centered frame:
+
+          - visible center/divider/bound/cross (using masks)
+          - ego vehicle at image center
+
+        For now: no A* route, no global waypoint visualization.
+        """
+        if not self.is_visualize:
+            return
+        if self._ego_snap is None:
+            return
+        # if self.center_pts is None:
+        #     return
+
+
+        # Select visible/masked points (fallback to all if mask is None)
+        # center_vis  = self.center_pts[self.center_mask]   if self.center_mask  is not None else self.center_pts
+        # divider_vis = self.divider_pts[self.divider_mask] if self.divider_mask is not None else self.divider_pts
+        # bound_vis   = self.bound_pts[self.bound_mask]     if self.bound_mask   is not None else self.bound_pts
+        # cross_vis   = self.cross_pts[self.cross_mask]     if self.cross_mask   is not None else self.cross_pts
+
+        if self.use_masked_points:
+            center_vis = self.center_pts
+            divider_vis = self.divider_pts
+            bound_vis = self.bound_pts
+            cross_vis = self.cross_pts
+        else:
+            center_vis  = self.center_pts[self.center_mask]   if self.center_mask  is not None else self.center_pts
+            divider_vis = self.divider_pts[self.divider_mask] if self.divider_mask is not None else self.divider_pts
+            bound_vis   = self.bound_pts[self.bound_mask]     if self.bound_mask   is not None else self.bound_pts
+            cross_vis   = self.cross_pts[self.cross_mask]     if self.cross_mask   is not None else self.cross_pts
+
+
+        path_pts = self._local_center_path if self.has_valid_local_path else None
+
+
+        # Delegate image creation to modular helper (same as hdmap_vis.py)
+        img = self._make_hdmap_image_ego(
+            center_pts=center_vis,
+            divider_pts=divider_vis,
+            bound_pts=bound_vis,
+            cross_pts=cross_vis,
+            ego_snap=self._ego_snap,
+            img_size=(800, 800),
+            pixels_per_meter=4.0,
+            curr_wp_world=self._curr_wp_world,
+            next_wp_world=self._next_wp_world,
+            path_pts=path_pts,
+        )
+
+        cv2.imshow("HDMap_Debug", img)
+        cv2.waitKey(1)
+
+
+    @property
+    def has_valid_local_path(self) -> bool:
+        """
+        True if last A* succeeded AND projection was OK AND we have non-empty path.
+        """
+        return (
+            self._path_valid
+            and self._projection_ok
+            and self._local_center_path is not None
+            and len(self._local_center_path) > 0
+        )
+
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
@@ -322,7 +641,112 @@ class HDMap:
     def tick(self):
         """Call this every control cycle to update masks and actor states."""
         self._update_hdmap_info()
-        self._update_waypoint_cursor()
+        # self._update_waypoint_cursor()
+
+        # NEW: visualize current map + waypoints + route
+        if self.is_visualize:
+            self._draw_hdmap_debug()
+
+
+    def update_route_between_globals(
+        self,
+        curr_wp_world: Optional[np.ndarray],
+        next_wp_world: Optional[np.ndarray],
+    ) -> None:
+        """
+        Update the A* path between two global waypoints in WORLD coordinates.
+
+        Arguments:
+          curr_wp_world : np.array([x,y,z]) or None
+          next_wp_world : np.array([x,y,z]) or None
+
+        Behavior:
+          - If next_wp_world is None -> do NOT update; keep existing path.
+          - If (curr_wp_world, next_wp_world) is unchanged (within tolerance),
+            do NOT recompute A*.
+          - Otherwise:
+              * project both to nearest center_pts (XY)
+              * if either is farther than projection_max_dist -> mark failure
+              * else run A* between those two center_pts nodes and store path.
+        """
+        # 1) no next waypoint => nothing to update
+        if next_wp_world is None:
+            return
+
+        if curr_wp_world is None:
+            # can't define a segment if we don't know the current wp
+            self._path_valid = False
+            self._projection_ok = False
+            self._local_center_path = None
+            self._local_center_path_progress = 0
+            return
+
+        # # Normalize to np.array shape (3,)
+        curr_wp_world = np.asarray(curr_wp_world, dtype=float).reshape(-1)
+        next_wp_world = np.asarray(next_wp_world, dtype=float).reshape(-1)
+
+        # 2) if pair unchanged (within small tolerance), skip recomputing
+        if (
+            self._last_curr_wp_world is not None
+            and self._last_next_wp_world is not None
+            and np.allclose(curr_wp_world, self._last_curr_wp_world, atol=1e-3)
+            and np.allclose(next_wp_world, self._last_next_wp_world, atol=1e-3)
+            and self.has_valid_local_path
+        ):
+            # nothing changed; keep existing path
+            return
+
+        # # Remember this pair
+        self._curr_wp_world = curr_wp_world
+        self._next_wp_world = next_wp_world
+        self._last_curr_wp_world = curr_wp_world.copy()
+        self._last_next_wp_world = next_wp_world.copy()
+
+        # 3) ensure A* planner exists
+        self._ensure_astar_planner()
+        if self._astar_planner is None:
+            self._path_valid = False
+            self._projection_ok = False
+            self._local_center_path = None
+            self._local_center_path_progress = 0
+            return
+
+        # 4) project both endpoints to center_pts
+        start_xy = curr_wp_world[:2]
+        goal_xy  = next_wp_world[:2]
+
+        start_idx, d_start = self._project_to_center_idx(start_xy)
+        goal_idx,  d_goal  = self._project_to_center_idx(goal_xy)
+
+        if (
+            start_idx < 0
+            or goal_idx < 0
+            or d_start > self._projection_max_dist
+            or d_goal  > self._projection_max_dist
+        ):
+            # projection fails: HDMap coverage not large enough in current view
+            self._projection_ok = False
+            self._path_valid = False
+            self._local_center_path = None
+            self._local_center_path_progress = 0
+            print(f"[HDMap] A* projection failed: d_start={d_start:.2f}, d_goal={d_goal:.2f}")
+            return
+
+        self._projection_ok = True
+
+        # 5) run A* between these two center_pts nodes
+        idx_path = self._astar_planner.plan_indices(start_idx, goal_idx)
+        if idx_path is None or len(idx_path) == 0:
+            self._path_valid = False
+            self._local_center_path = None
+            self._local_center_path_progress = 0
+            print("[HDMap] A* planning failed: no path found.")
+            return
+
+        # 6) map node indices to full (x,y,z) center_pts
+        self._local_center_path = self.center_pts[idx_path, :]  # (M, 3)
+        self._local_center_path_progress = 0
+        self._path_valid = True
 
 
     def get_next_waypoint(self, location: Optional[Tuple[float, float, float]] = None, lookahead: int = 10) -> np.ndarray:
@@ -447,6 +871,12 @@ class HDMap:
         return False
 
 
+    def is_nextlane_free(self, distance: float = 20.0, clearance: float = 3.0) -> bool:
+        # Check if the next-lane waypoint is free of obstacles within given distance.
+        # Simple circular clearance check.
+        pass
+
+    
     def is_traffic_light_red(self):
         # Check if the traffic light in front of the ego vehicle is red
         pass

@@ -282,150 +282,50 @@ def get_gemap_vis(center_pts, divider_pts, bound_pts, cross_pts, bboxes, ego_veh
             mids.append(mid)
         return np.array(mids)  # (4,3)
     if bboxes is not None:
-        # bboxes is expected to be a tuple/list: (vehicle_list, pedestrian_list)
-        ve_list = bboxes[0] if len(bboxes) > 0 and bboxes[0] is not None else []
-        pe_list = bboxes[1] if len(bboxes) > 1 and bboxes[1] is not None else []
+        ve_bboxes = np.array([bb['gt_array'] for bb in bboxes[0]])
+        ve_bboxes_corners = np.array([bb['corners_world'] for bb in bboxes[0]])
+        ve_bboxes_label = np.array([bb['label'] for bb in bboxes[0]])
+        pe_bboxes = np.array([bb['gt_array'] for bb in bboxes[1]])
+        pe_bboxes_corners = np.array([bb['corners_world'] for bb in bboxes[1]])
+        pe_bboxes_label = np.array([bb['label'] for bb in bboxes[1]])
+        bboxes_3d = np.concatenate([ve_bboxes, pe_bboxes], axis=0)
+        bboxes_3d_corners = np.concatenate([ve_bboxes_corners, pe_bboxes_corners], axis=0)
+        number = bboxes_3d.shape[0]
+        mask = np.zeros((number,), dtype=bool)
+        mask = mask | filter_points(bboxes_3d[:, :3], ego_vehicle, camera_units[0]['sensor'], max_distance_m=61, min_distance_m=0.1)[0]
+        mask = mask | filter_points(bboxes_3d[:, :3], ego_vehicle, camera_units[1]['sensor'], max_distance_m=61, min_distance_m=0.1)[0]
+        for idx, bbox in enumerate(bboxes_3d_corners):
+        # bbox: (8,3) world corners
+            if mask[idx] == True:
+                if bbox.shape[0] < 4:
+                    continue  # 안전장치
 
-        # If nothing to draw, skip early
-        if len(ve_list) + len(pe_list) > 0:
+                top4 = get_top_face_points(bbox)           # (4,3)
+                mids4 = edge_midpoints(top4)               # (4,3)
 
-            # Determine K (length of gt_array per object), assuming at least one exists
-            sample_gt = ve_list[0]['gt_array'] if ve_list else pe_list[0]['gt_array']
-            K = int(np.asarray(sample_gt).shape[-1])
+                # 코너 점 표시
+                for (x,y,z) in top4:
+                    ix, iy = world_to_image(x, y)
+                    cv2.circle(img, (ix, iy), 3, bbox_color, -1)
 
-            def build_gt(list_):
-                if not list_:
-                    # 0 rows, K columns
-                    return np.empty((0, K), dtype=np.float32)
-                arr = np.asarray([bb['gt_array'] for bb in list_], dtype=np.float32)
-                return arr.reshape(-1, K)
+                # 변 중점 표시
+                for (x,y,z) in mids4:
+                    ix, iy = world_to_image(x, y)
+                    cv2.circle(img, (ix, iy), 2, bbox_color, -1)
 
-            def build_corners(list_):
-                if not list_:
-                    # 0 boxes, 8 corners, 3 coords
-                    return np.empty((0, 8, 3), dtype=np.float32)
-                arr = np.asarray([bb['corners_world'] for bb in list_], dtype=np.float32)
-                return arr.reshape(-1, 8, 3)
-
-            ve_bboxes         = build_gt(ve_list)
-            pe_bboxes         = build_gt(pe_list)
-            ve_bboxes_corners = build_corners(ve_list)
-            pe_bboxes_corners = build_corners(pe_list)
-            ve_labels         = [bb.get('label', 0) for bb in ve_list]
-            pe_labels         = [bb.get('label', 0) for bb in pe_list]
-
-            # Safe vertical stacks (still work if one side is empty)
-            if ve_bboxes.size or pe_bboxes.size:
-                bboxes_3d = np.vstack([ve_bboxes, pe_bboxes])
-            else:
-                bboxes_3d = np.empty((0, K), dtype=np.float32)
-
-            if ve_bboxes_corners.size or pe_bboxes_corners.size:
-                bboxes_3d_corners = np.vstack([ve_bboxes_corners, pe_bboxes_corners])
-            else:
-                bboxes_3d_corners = np.empty((0, 8, 3), dtype=np.float32)
-
-            labels = ve_labels + pe_labels
-            number = bboxes_3d.shape[0]
-
-            if number > 0:
-                # Frustum filter with one or more cameras
-                mask = np.zeros((number,), dtype=bool)
-
-                # always use the first camera
-                mask = mask | filter_points(
-                    bboxes_3d[:, :3],
-                    ego_vehicle,
-                    camera_units[0]['sensor'],
-                    max_distance_m=61,
-                    min_distance_m=0.1
-                )[0]
-
-                # only use the 2nd camera if it exists
-                if len(camera_units) > 1 and camera_units[1].get('sensor') is not None:
-                    mask = mask | filter_points(
-                        bboxes_3d[:, :3],
-                        ego_vehicle,
-                        camera_units[1]['sensor'],
-                        max_distance_m=61,
-                        min_distance_m=0.1
-                    )[0]
-
-                # Draw only masked boxes
-                for idx, corners8 in enumerate(bboxes_3d_corners):
-                    if not mask[idx]:
-                        continue
-
-                    # corners8: (8,3)
-                    if corners8.shape[0] < 4:
-                        continue
-
-                    top4 = get_top_face_points(corners8)  # (4,3)
-                    mids4 = edge_midpoints(top4)          # (4,3)
-
-                    # top face corners
-                    for (x, y, z) in top4:
-                        ix, iy = world_to_image(x, y)
-                        cv2.circle(img, (ix, iy), 3, bbox_color, -1)
-
-                    # edge midpoints
-                    for (x, y, z) in mids4:
-                        ix, iy = world_to_image(x, y)
-                        cv2.circle(img, (ix, iy), 2, bbox_color, -1)
-
-                    # outline
-                    for i in range(4):
-                        x0, y0, _ = top4[i]
-                        x1, y1, _ = top4[(i + 1) % 4]
-                        ix0, iy0 = world_to_image(x0, y0)
-                        ix1, iy1 = world_to_image(x1, y1)
-                        cv2.line(img, (ix0, iy0), (ix1, iy1), bbox_color, 1)
-        # ve_bboxes = np.array([bb['gt_array'] for bb in bboxes[0]])
-        # ve_bboxes_corners = np.array([bb['corners_world'] for bb in bboxes[0]])
-        # ve_bboxes_label = np.array([bb['label'] for bb in bboxes[0]])
-        # pe_bboxes = np.array([bb['gt_array'] for bb in bboxes[1]])
-        # pe_bboxes_corners = np.array([bb['corners_world'] for bb in bboxes[1]])
-        # pe_bboxes_label = np.array([bb['label'] for bb in bboxes[1]])
-        # bboxes_3d = np.concatenate([ve_bboxes, pe_bboxes], axis=0)
-        # bboxes_3d_corners = np.concatenate([ve_bboxes_corners, pe_bboxes_corners], axis=0)
-        # number = bboxes_3d.shape[0]
-        # mask = np.zeros((number,), dtype=bool)
-        # mask = mask | filter_points(bboxes_3d[:, :3], ego_vehicle, camera_units[0]['sensor'], max_distance_m=61, min_distance_m=0.1)[0]
-        # if len(camera_units) >1:
-        #     mask = mask | filter_points(bboxes_3d[:, :3], ego_vehicle, camera_units[1]['sensor'], max_distance_m=61, min_distance_m=0.1)[0]
-        # for idx, bbox in enumerate(bboxes_3d_corners):
-        # # bbox: (8,3) world corners
-        #     if mask[idx] == True:
-        #         if bbox.shape[0] < 4:
-        #             continue  # 안전장치
-
-        #         top4 = get_top_face_points(bbox)           # (4,3)
-        #         mids4 = edge_midpoints(top4)               # (4,3)
-
-        #         # 코너 점 표시
-        #         for (x,y,z) in top4:
-        #             ix, iy = world_to_image(x, y)
-        #             cv2.circle(img, (ix, iy), 3, bbox_color, -1)
-
-        #         # 변 중점 표시
-        #         for (x,y,z) in mids4:
-        #             ix, iy = world_to_image(x, y)
-        #             cv2.circle(img, (ix, iy), 2, bbox_color, -1)
-
-        #         # 원하면 윤곽선도 그릴 수 있음 (top face 폴리라인)
-        #         for i in range(4):
-        #             x0,y0,_ = top4[i]
-        #             x1,y1,_ = top4[(i+1)%4]
-        #             ix0, iy0 = world_to_image(x0, y0)
-        #             ix1, iy1 = world_to_image(x1, y1)
-        #             cv2.line(img, (ix0, iy0), (ix1, iy1), bbox_color, 1)
+                # 원하면 윤곽선도 그릴 수 있음 (top face 폴리라인)
+                for i in range(4):
+                    x0,y0,_ = top4[i]
+                    x1,y1,_ = top4[(i+1)%4]
+                    ix0, iy0 = world_to_image(x0, y0)
+                    ix1, iy1 = world_to_image(x1, y1)
+                    cv2.line(img, (ix0, iy0), (ix1, iy1), bbox_color, 1)
 
     # 중심에 ego 차량 위치 마커 표시
     cv2.circle(img, origin, 4, (0, 0, 255), -1)
     cv2.putText(img, "EGO", (origin[0]+5, origin[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,255), 1)
 
     return img
-
 def filter_by_cameras(camera, ego_vehicle, center_pts, divider_pts, bound_pts, cross_pts, masks, max_dist=61, min_dist= 0.1):
 
     center_mask,_ = filter_points(center_pts, ego_vehicle=ego_vehicle, sensor_actor=camera, max_distance_m=61, min_distance_m=0.1)
@@ -434,7 +334,7 @@ def filter_by_cameras(camera, ego_vehicle, center_pts, divider_pts, bound_pts, c
     cross_mask,_ = filter_points(cross_pts, ego_vehicle=ego_vehicle, sensor_actor=camera, max_distance_m=61, min_distance_m=0.1)
     return (masks[0].astype(bool)| center_mask), (masks[1].astype(bool)| divider_mask), (masks[2].astype(bool) | bound_mask), (masks[3].astype(bool) | cross_mask)
 
-def transform_points_world_to_sensor(points_world, sensor_transform):
+def transform_points_world_to_sensor_prev(points_world, sensor_transform):
     """
     points_world: (N,3) np.ndarray in world frame [x,y,z]
     sensor_transform: carla.Transform of the sensor (location + rotation in world)
@@ -479,6 +379,43 @@ def transform_points_world_to_sensor(points_world, sensor_transform):
     p_rel = points_world - t[None, :]          # (N,3)
     p_sensor = p_rel @ R_ws.T                  # (N,3)
     return p_sensor
+
+
+def transform_points_world_to_sensor(points_world, sensor_transform):
+    """
+    points_world: (N,3) np.ndarray in world frame [x,y,z]
+    sensor_transform: carla.Transform of the sensor (location + rotation in world)
+    return: (N,3) points expressed in the *sensor* (local) frame
+
+    This implementation uses CARLA's built-in 4x4 transform matrix
+    to avoid mistakes with manual yaw/pitch/roll composition.
+    """
+
+    # 1) Get 4x4 matrix that maps from sensor local -> world
+    #    (this is CARLA / UE4's own transform)
+    m_sw = np.array(sensor_transform.get_matrix(), dtype=np.float32)  # shape (4,4)
+
+    # 2) Invert it to get world -> sensor
+    m_ws = np.linalg.inv(m_sw)  # still (4,4)
+
+    # 3) Convert input points to homogeneous coords
+    #    points_world: (N,3) -> (N,4) with last coord = 1
+    if not isinstance(points_world, np.ndarray):
+        points_world = np.array(points_world, dtype=np.float32)
+
+    if points_world.ndim != 2 or points_world.shape[1] != 3:
+        raise ValueError("points_world must be (N,3) array")
+
+    ones = np.ones((points_world.shape[0], 1), dtype=np.float32)
+    pts_world_h = np.concatenate([points_world.astype(np.float32), ones], axis=1)  # (N,4)
+
+    # 4) Apply world->sensor transform
+    #    (N,4) @ (4,4)^T -> (N,4)
+    pts_sensor_h = pts_world_h @ m_ws.T
+
+    # 5) Drop homogeneous coordinate, return (N,3)
+    pts_sensor = pts_sensor_h[:, :3]
+    return pts_sensor
 
 
 def filter_points(points_world,
@@ -559,6 +496,8 @@ def filter_points(points_world,
     final_mask = np.zeros(points_world.shape[0], dtype=bool)
     surviving_idx = np.nonzero(dist_mask)[0]          # indices in original array that passed dist
     final_mask[surviving_idx[fov_mask_local]] = True  # keep only also in FOV
+
+    # final_mask = np.ones(points_world.shape[0], dtype=bool)
 
     return final_mask, points_world[final_mask]
 

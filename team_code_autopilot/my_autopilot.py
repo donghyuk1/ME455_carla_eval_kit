@@ -11,6 +11,8 @@ import math
 from leaderboard.autoagents import autonomous_agent
 from my_auto_config import MyAutoConfig
 
+from utils.hdmap import HDMap
+
 from ultralytics import YOLO
 
 from team_code_autopilot.utils.autopilot_fsm import build_vehicle_fsm
@@ -213,6 +215,12 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
         self.last_rgb = None
 
 
+        # HDMap Utils
+        self.hdmap = None
+        self._global_plan_world = None  
+        self._global_route_idx = 0          # index into global_plan_* for "current" route[0]
+        self._route_len_prev = None         # track how many waypoints RoutePlanner has in its deque
+
         # YOLO traffic light detection
         self.use_yolo = False
         self.yolo_model = None
@@ -235,6 +243,9 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
             print(f"[YOLO] Failed to initialize: {e}")
             self.use_yolo = False
 
+        self._prev_global_wp_world = None
+        self._current_global_wp_world = None
+
 
         # Traffic light detection state
         self.traffic_lights_detected = []
@@ -255,6 +266,7 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
             return torch.cuda.is_available()
         except ImportError:
             return False
+
 
 
 
@@ -303,6 +315,28 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
             return
         # Convert global plan (lat/lon) to meter XY
         self._route_planner.set_route(self._global_plan, True)
+
+        # ---------------- HDMap init (for visualization only) ----------------
+        if self.hdmap is None:
+            cam_res = (self.config.camera_width, self.config.camera_height)
+
+            # host/port/role: adjust if you store them in config
+            hd_host = "127.0.0.1"
+            hd_port = 2000
+            hd_role = "hero"
+
+            self.hdmap = HDMap(
+                host=hd_host,
+                port=hd_port,
+                role=hd_role,
+                cam_res=cam_res,
+                frustum_max_dist=float(self.config.route_planner_max_distance),
+                sensor_tick=0.0,
+                is_visualize=True,  # show HDMap window for debugging
+            )
+            
+            print("[HDMap] Initialized HDMap utility for visualization.")
+
         self.initialized = True
 
     def _get_position_xy(self, gps_latlon):
@@ -398,6 +432,35 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
         # Route planning: obtain next waypoint & command
         route = self._route_planner.run_step(pos_xy)
         next_wp, next_cmd = route[1] if len(route) > 1 else route[0]
+
+        # next_wp_world = np.array([float(next_wp[0]), float(next_wp[1]), 0.0], dtype=float)
+        next_wp_world = np.array([float(next_wp[1]), -float(next_wp[0]), 0.0], dtype=float)
+
+
+        # 3) If this is the first time, just initialize current and skip A*
+        if self._current_global_wp_world is None:
+            self._current_global_wp_world = next_wp_world
+        else:
+            # Check if next_wp changed compared to current_global_wp
+            if not np.allclose(
+                next_wp_world[:2],
+                self._current_global_wp_world[:2],
+                atol=1e-3
+            ):
+                # Waypoint changed → shift current → prev, update current
+                self._prev_global_wp_world = self._current_global_wp_world
+                self._current_global_wp_world = next_wp_world
+
+        # -----------------------------------------------------
+        # HDMap debug: update masks + A* route (for visualization only)
+        # -----------------------------------------------------
+        if self.hdmap is not None:
+            # 1) Update HDMap internal state (ego pose, masks, etc.)
+            self.hdmap.tick()
+            self.hdmap.update_route_between_globals(self._prev_global_wp_world, self._current_global_wp_world)
+        else:
+            print("[HDMap] Warning: HDMap utility not initialized; skipping HDMap debug update.")
+
 
         # Transform next waypoint to ego local frame using compass
         dn = float(next_wp[0] - pos_xy[0])   # northing (lat)
