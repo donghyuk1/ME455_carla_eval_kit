@@ -68,7 +68,7 @@ class HDMap:
         self.max_dist = float(frustum_max_dist)
         self.sensor_tick = float(sensor_tick)
         self.is_visualize = bool(is_visualize)
-        self.use_masked_points = False  # whether to filter hdmap points by frustum masks
+        # self.use_masked_points = False  # whether to filter hdmap points by frustum masks
 
         if self.is_visualize:
             cv2.namedWindow("HDMap_Debug", cv2.WINDOW_NORMAL)
@@ -83,28 +83,7 @@ class HDMap:
         self.camera_units = []
         self.sensors = []  # for cleanup
 
-        # # RGB sensors (we only need RGB_1, RGB_2 for gemap_vis; lidar_1는 생략 가능)
-        # for cam_name, cam_cfg in CAMERA_SETUPS.items():
-        #     if not cam_cfg.get('enabled', True):
-        #         continue
-        #     if not cam_name.startswith('RGB'):
-        #         continue  # lidar는 HD map vis에는 필요 없음 (원하면 따로 추가 가능)
 
-        #     loc = cam_cfg.get('location', (0.5, 0.0, 2.2))
-        #     rot = cam_cfg.get('rotation', (-8.0, 0.0, 0.0))
-
-        #     sensor = self._spawn_rgb(self.world, self.ego, self.w, self.h, loc=loc, rot=rot, sensor_tick=self.sensor_tick)
-        #     if sensor is None:
-        #         print(f"[hdmap_vis] Failed to spawn {cam_name}")
-        #         continue
-
-        #     self.sensors.append(sensor)
-        #     self.camera_units.append({
-        #         'name': cam_name,
-        #         'sensor': sensor,
-        #         'depth_sensor': None,  # datagen에서는 depth도 있지만 여기서는 불필요
-        #         'dirs': {}
-        #     })
 
         # Parsed OpenDRIVE polylines (static)
         self.center_pts: Optional[np.ndarray] = None
@@ -120,6 +99,11 @@ class HDMap:
         self.divider_mask = np.zeros(len(self.divider_pts), dtype=bool) if self.divider_pts is not None else None
         self.bound_mask = np.zeros(len(self.bound_pts), dtype=bool) if self.bound_pts is not None else None
         self.cross_mask = np.zeros(len(self.cross_pts), dtype=bool) if self.cross_pts is not None else None
+
+        self.center_mask_clustered = None
+        self.divider_mask_clustered = None
+        self.bound_mask_clustered = None
+        self.cross_mask_clustered = None
 
         # Snapshots of actors (last tick)
         self._ego_snap = None
@@ -149,7 +133,7 @@ class HDMap:
         self._projection_max_dist: float = 10.0  # m
         self._projection_ok: bool = False
         self._path_valid: bool = False
-
+ 
 
 
     def __del__(self):
@@ -201,6 +185,7 @@ class HDMap:
         xodr = self.map.to_opendrive()
         self.center_pts, self.divider_pts, self.bound_pts, self.cross_pts, self.idxes = tx.extract_waypoints(xodr)
     
+
 
     def _reacquire_ego_and_cameras_if_needed(self) -> bool:
         """
@@ -265,6 +250,113 @@ class HDMap:
         return float(np.dot(d, d))
 
 
+    def _group_points_by_id(
+        self,
+        pts: Optional[np.ndarray],
+        idx_array: Optional[np.ndarray],
+        mask: Optional[np.ndarray] = None,
+    ):
+        """
+        Group points into polylines using idx_array (one ID per point).
+
+        Returns:
+            - list of (Mi, 3) np.ndarrays, each corresponding to a single polyline
+            - or a single (N, 3) np.ndarray if idx_array is None (fallback)
+        """
+        if pts is None:
+            return None
+
+        pts = np.asarray(pts)
+        if pts.size == 0:
+            return pts  # empty array
+
+        # If we don't have index information, just apply mask and return flat points
+        if idx_array is None:
+            if mask is not None:
+                return pts[mask]
+            return pts
+
+        idx_array = np.asarray(idx_array)
+        assert len(idx_array) == len(pts), "idx_array length must match pts length"
+
+        if mask is not None:
+            pts = pts[mask]
+            idx_array = idx_array[mask]
+
+        if len(pts) == 0:
+            return []
+
+        poly_ids = np.unique(idx_array)
+        grouped = [pts[idx_array == pid] for pid in poly_ids]
+        return grouped
+
+
+    def _find_closest_center_cluster(
+        self,
+        location_xy: np.ndarray,
+    ):
+        """
+        Given a 2D world location (x, y), find the closest centerline cluster.
+
+        Uses self.center_mask_clustered, which is a list of (Mi, 3) arrays
+        returned by _group_points_by_id(...).
+
+        Args:
+            location_xy: np.ndarray shape (2,) or (3,), world-frame (x, y [, z])
+
+        Returns:
+            (best_idx, best_cluster_pts, best_dist)
+
+            best_idx:
+                - index into self.center_mask_clustered
+                - -1 if not found / no clusters
+            best_cluster_pts:
+                - (Mi, 3) np.ndarray of the chosen cluster
+                - None if no cluster found
+            best_dist:
+                - minimal Euclidean distance [m] from location_xy to any point in that cluster
+                - float("inf") if no cluster found
+        """
+        # Normalize input location to [x, y]
+        loc = np.asarray(location_xy, dtype=float).reshape(-1)
+        if loc.size >= 2:
+            loc_xy = loc[:2]
+        else:
+            raise ValueError("location_xy must have at least 2 elements (x, y).")
+
+        # Make sure clusters exist
+        clusters = getattr(self, "center_mask_clustered", None)
+        if clusters is None or len(clusters) == 0:
+            print("[HDMap] Warning: center_mask_clustered is empty; cannot find closest cluster.")
+            return -1, None, float("inf")
+
+        best_idx = -1
+        best_d2 = float("inf")
+        best_cluster = None
+
+        for i, seg in enumerate(clusters):
+            if seg is None or len(seg) == 0:
+                continue
+
+            seg = np.asarray(seg)
+            # seg is (Mi, 3) -> take XY
+            seg_xy = seg[:, :2]
+
+            diff = seg_xy - loc_xy[None, :]
+            d2 = np.einsum("ij,ij->i", diff, diff)
+            local_min = float(d2.min())
+
+            if local_min < best_d2:
+                best_d2 = local_min
+                best_idx = i
+                best_cluster = seg
+
+        if best_idx < 0:
+            return -1, None, float("inf")
+
+        return best_idx, best_cluster, math.sqrt(best_d2)
+
+
     def _closest_global_idx_ahead(self, location_xy: np.ndarray, min_forward_dot: float = 0.0) -> int:
         """
         Very simple "closest ahead" selector on the precomputed global waypoints.
@@ -305,13 +397,6 @@ class HDMap:
           - ego & other actors snapshot
           - camera-based frustum masks for center/divider/bound/cross
         """
-        # 1) Keep ego/cam valid
-        # if self.ego is None:
-        #     # Still not ready; skip this tick gracefully
-        #     self.ego: Optional[carla.Actor] = self._find_ego_by_role(self.world, self.role)
-        #     if self.ego is None:
-        #         self.is_ego_ready = False
-        #         raise RuntimeError("Ego vehicle not found")
         
         # 1) Keep ego & cameras valid; if not ready, skip this tick gracefully
         if not self._reacquire_ego_and_cameras_if_needed():
@@ -375,11 +460,6 @@ class HDMap:
         self.bound_mask = bound_mask
         self.cross_mask = cross_mask
 
-        if self.use_masked_points:
-            self.center_pts = self.center_pts[self.center_mask] if self.center_pts is not None else self.center_pts
-            self.divider_pts = self.divider_pts[self.divider_mask] if self.divider_pts is not None else self.divider_pts
-            self.bound_pts = self.bound_pts[self.bound_mask] if self.bound_pts is not None else self.bound_pts
-            self.cross_pts = self.cross_pts[self.cross_mask] if self.cross_pts is not None else self.cross_pts
 
     def _update_waypoint_cursor(self):
         """Maintain a simple forward-moving cursor along global sparse waypoints."""
@@ -492,10 +572,36 @@ class HDMap:
             iy = int(round(cy - Y_body * pixels_per_meter))  # forward => up
             return ix, iy
 
+        # def draw_points(pts, color, radius=1):
+        #     if pts is None or len(pts) == 0:
+        #         return
+        #     pts = np.asarray(pts)
+        #     xs = pts[:, 0]
+        #     ys = pts[:, 1]
+        #     for x, y in zip(xs, ys):
+        #         ix, iy = world_to_ego_pixel(x, y)
+        #         if 0 <= ix < w and 0 <= iy < h:
+        #             cv2.circle(img, (ix, iy), radius, color, -1)
+
         def draw_points(pts, color, radius=1):
-            if pts is None or len(pts) == 0:
+            """
+            Draw points for:
+              - a single (N, 3) numpy array, or
+              - a list / tuple of such arrays (polylines).
+            """
+            if pts is None:
                 return
+
+            # If we got polyline groups, recurse on each
+            if isinstance(pts, (list, tuple)):
+                for seg in pts:
+                    draw_points(seg, color, radius)
+                return
+
             pts = np.asarray(pts)
+            if pts.size == 0:
+                return
+
             xs = pts[:, 0]
             ys = pts[:, 1]
             for x, y in zip(xs, ys):
@@ -503,11 +609,13 @@ class HDMap:
                 if 0 <= ix < w and 0 <= iy < h:
                     cv2.circle(img, (ix, iy), radius, color, -1)
 
+
         def draw_polyline(pts, color, thickness=2):
-            """Draw a polyline in ego-centered image for world-frame pts."""
-            if pts is None or len(pts) < 2:
+            if pts is None:
                 return
             pts = np.asarray(pts)
+            if len(pts) < 2:
+                return
             xs = pts[:, 0]
             ys = pts[:, 1]
             prev_px = None
@@ -518,7 +626,7 @@ class HDMap:
                         cv2.line(img, prev_px, (ix, iy), color, thickness)
                     prev_px = (ix, iy)
                 else:
-                    prev_px = None  # break the polyline if out of frame
+                    prev_px = None
 
         # Colors
         color_center  = (0, 255, 255)  # centerline
@@ -579,37 +687,23 @@ class HDMap:
             return
         if self._ego_snap is None:
             return
-        # if self.center_pts is None:
-        #     return
 
+        center_idx, divider_idx, bound_idx, cross_idx = self.idxes
 
-        # Select visible/masked points (fallback to all if mask is None)
-        # center_vis  = self.center_pts[self.center_mask]   if self.center_mask  is not None else self.center_pts
-        # divider_vis = self.divider_pts[self.divider_mask] if self.divider_mask is not None else self.divider_pts
-        # bound_vis   = self.bound_pts[self.bound_mask]     if self.bound_mask   is not None else self.bound_pts
-        # cross_vis   = self.cross_pts[self.cross_mask]     if self.cross_mask   is not None else self.cross_pts
-
-        if self.use_masked_points:
-            center_vis = self.center_pts
-            divider_vis = self.divider_pts
-            bound_vis = self.bound_pts
-            cross_vis = self.cross_pts
-        else:
-            center_vis  = self.center_pts[self.center_mask]   if self.center_mask  is not None else self.center_pts
-            divider_vis = self.divider_pts[self.divider_mask] if self.divider_mask is not None else self.divider_pts
-            bound_vis   = self.bound_pts[self.bound_mask]     if self.bound_mask   is not None else self.bound_pts
-            cross_vis   = self.cross_pts[self.cross_mask]     if self.cross_mask   is not None else self.cross_pts
+        self.center_mask_clustered  = self._group_points_by_id(self.center_pts,  center_idx,  self.center_mask)
+        self.divider_mask_clustered = self._group_points_by_id(self.divider_pts, divider_idx, self.divider_mask)
+        self.bound_mask_clustered   = self._group_points_by_id(self.bound_pts,   bound_idx,   self.bound_mask)
+        self.cross_mask_clustered   = self._group_points_by_id(self.cross_pts,   cross_idx,   self.cross_mask)
 
 
         path_pts = self._local_center_path if self.has_valid_local_path else None
 
-
         # Delegate image creation to modular helper (same as hdmap_vis.py)
         img = self._make_hdmap_image_ego(
-            center_pts=center_vis,
-            divider_pts=divider_vis,
-            bound_pts=bound_vis,
-            cross_pts=cross_vis,
+            center_pts=self.center_mask_clustered,
+            divider_pts=self.divider_mask_clustered,
+            bound_pts=self.bound_mask_clustered,
+            cross_pts=self.cross_mask_clustered,
             ego_snap=self._ego_snap,
             img_size=(800, 800),
             pixels_per_meter=4.0,
@@ -629,7 +723,6 @@ class HDMap:
         """
         return (
             self._path_valid
-            and self._projection_ok
             and self._local_center_path is not None
             and len(self._local_center_path) > 0
         )
@@ -702,51 +795,21 @@ class HDMap:
         self._last_curr_wp_world = curr_wp_world.copy()
         self._last_next_wp_world = next_wp_world.copy()
 
-        # 3) ensure A* planner exists
-        self._ensure_astar_planner()
-        if self._astar_planner is None:
-            self._path_valid = False
-            self._projection_ok = False
-            self._local_center_path = None
+        # wp_xy is a (2,) numpy array in world coords
+        idx, cluster_pts, dist = self._find_closest_center_cluster(self._next_wp_world)
+
+        if idx >= 0:
+            # cluster_pts is (Mi, 3) – this will be your “local route” to follow
+            self._local_center_path = cluster_pts.copy()
             self._local_center_path_progress = 0
-            return
-
-        # 4) project both endpoints to center_pts
-        start_xy = curr_wp_world[:2]
-        goal_xy  = next_wp_world[:2]
-
-        start_idx, d_start = self._project_to_center_idx(start_xy)
-        goal_idx,  d_goal  = self._project_to_center_idx(goal_xy)
-
-        if (
-            start_idx < 0
-            or goal_idx < 0
-            or d_start > self._projection_max_dist
-            or d_goal  > self._projection_max_dist
-        ):
-            # projection fails: HDMap coverage not large enough in current view
-            self._projection_ok = False
+            self._path_valid = True
+        else:
             self._path_valid = False
-            self._local_center_path = None
-            self._local_center_path_progress = 0
-            print(f"[HDMap] A* projection failed: d_start={d_start:.2f}, d_goal={d_goal:.2f}")
-            return
 
-        self._projection_ok = True
-
-        # 5) run A* between these two center_pts nodes
-        idx_path = self._astar_planner.plan_indices(start_idx, goal_idx)
-        if idx_path is None or len(idx_path) == 0:
-            self._path_valid = False
-            self._local_center_path = None
-            self._local_center_path_progress = 0
-            print("[HDMap] A* planning failed: no path found.")
-            return
-
-        # 6) map node indices to full (x,y,z) center_pts
-        self._local_center_path = self.center_pts[idx_path, :]  # (M, 3)
-        self._local_center_path_progress = 0
-        self._path_valid = True
+        # # 6) map node indices to full (x,y,z) center_pts
+        # self._local_center_path = self.center_pts[idx_path, :]  # (M, 3)
+        # self._local_center_path_progress = 0
+        # self._path_valid = True
 
 
     def get_next_waypoint(self, location: Optional[Tuple[float, float, float]] = None, lookahead: int = 10) -> np.ndarray:
