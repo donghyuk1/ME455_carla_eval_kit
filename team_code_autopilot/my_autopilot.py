@@ -372,6 +372,145 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
             'traffic_lights': self.traffic_lights_detected,
 
         }
+    
+
+    def _route_overlaps_bbox(self, route_pts, bbox: dict, margin: float = 0.0) -> bool:
+        """
+        Check if a route (polyline) overlaps the ground-projected bbox rectangle.
+
+        Args:
+            route_pts:
+                - np.ndarray of shape (N, 2) or (N, 3) in world frame
+                  (usually one cluster from center_mask_clustered)
+            bbox:
+                - dict from ga.get_vehicle_bbox, with 'corners_world' etc.
+            margin:
+                - optional extra expansion [meters] of the bbox footprint
+                  (for safety margin / tolerance)
+
+        Returns:
+            True if any route point lies inside the rectangle (with margin),
+            or any route segment intersects the rectangle edges.
+        """
+        if route_pts is None or bbox is None:
+            return False
+
+        route = np.asarray(route_pts, dtype=float)
+        if route.ndim != 2 or route.shape[0] == 0:
+            return False
+
+        # Use XY only
+        route_xy = route[:, :2]
+
+        # ----- 1) Extract bbox footprint (ground rectangle) -----
+        corners_world = bbox.get("corners_world", None)
+        if not corners_world:
+            # Fallback: use gt_array as a point; not really a rectangle → treat as small circle
+            gt = bbox.get("gt_array", None)
+            if gt is None:
+                return False
+            center = np.asarray(gt[:2], dtype=float)
+            # Simply check if any route point is within margin of the center
+            d2 = np.sum((route_xy - center[None, :]) ** 2, axis=1)
+            return bool(np.any(d2 <= (margin ** 2 if margin > 0 else 0.5 ** 2)))
+
+        corners = np.asarray(corners_world, dtype=float)  # (8, 3) typically
+        foot_xy = corners[:, :2]  # project to ground
+
+        # Deduplicate XY pairs (bottom & top corners share XY)
+        uniq_xy, uniq_idx = np.unique(np.round(foot_xy, 3), axis=0, return_index=True)
+        poly_xy = foot_xy[uniq_idx]
+
+        if poly_xy.shape[0] < 3:
+            return False  # not enough to define polygon
+
+        # ----- 2) Order rectangle vertices (clockwise) -----
+        centroid = poly_xy.mean(axis=0)
+        rel = poly_xy - centroid[None, :]
+        angles = np.arctan2(rel[:, 1], rel[:, 0])
+        order = np.argsort(angles)
+        poly = poly_xy[order]  # (M, 2), M ~ 4
+
+        # Optional: expand polygon by 'margin' using simple axis-aligned margin
+        # (approximation; good enough for safety check)
+        if margin > 0.0:
+            min_x, min_y = poly[:, 0].min() - margin, poly[:, 1].min() - margin
+            max_x, max_y = poly[:, 0].max() + margin, poly[:, 1].max() + margin
+        else:
+            min_x, min_y = poly[:, 0].min(), poly[:, 1].min()
+            max_x, max_y = poly[:, 0].max(), poly[:, 1].max()
+
+        # ----- 3) Fast AABB rejection between route and bbox -----
+        r_min_x, r_min_y = route_xy[:, 0].min(), route_xy[:, 1].min()
+        r_max_x, r_max_y = route_xy[:, 0].max(), route_xy[:, 1].max()
+
+        if (r_max_x < min_x or r_min_x > max_x or
+            r_max_y < min_y or r_min_y > max_y):
+            return False  # clearly no overlap
+
+        # ----- 4) Precise point-in-polygon test (convex poly) -----
+        def point_in_convex_poly(p, poly_pts):
+            """
+            Check if point p is inside convex polygon poly_pts (2D).
+            Uses sign of cross products along edges.
+            """
+            x, y = p
+            sign = None
+            for i in range(len(poly_pts)):
+                x1, y1 = poly_pts[i]
+                x2, y2 = poly_pts[(i + 1) % len(poly_pts)]
+                cross = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1)
+                if cross == 0:
+                    continue  # on the edge is OK → treat as inside
+                curr_sign = cross > 0
+                if sign is None:
+                    sign = curr_sign
+                elif sign != curr_sign:
+                    return False  # different side → outside
+            return True
+
+        # If any route point lies inside the polygon → overlapping
+        for p in route_xy:
+            if point_in_convex_poly(p, poly):
+                return True
+
+        # ----- 5) Segment vs edge intersection check -----
+        def segments_intersect(p1, p2, q1, q2):
+            """
+            Check if line segments p1-p2 and q1-q2 intersect in 2D.
+            """
+            def orient(a, b, c):
+                return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+            o1 = orient(p1, p2, q1)
+            o2 = orient(p1, p2, q2)
+            o3 = orient(q1, q2, p1)
+            o4 = orient(q1, q2, p2)
+
+            # General case
+            if (o1 * o2 < 0) and (o3 * o4 < 0):
+                return True
+
+            # Collinear / endpoint cases can be added if needed; for now we ignore
+            return False
+
+        # Build polygon edges
+        edges = []
+        M = len(poly)
+        for i in range(M):
+            q1 = poly[i]
+            q2 = poly[(i + 1) % M]
+            edges.append((q1, q2))
+
+        # Check each route segment vs each polygon edge
+        for i in range(len(route_xy) - 1):
+            p1 = route_xy[i]
+            p2 = route_xy[i + 1]
+            for q1, q2 in edges:
+                if segments_intersect(p1, p2, q1, q2):
+                    return True
+
+        return False
 
     
     def _detect_traffic_lights(self, rgb_image):
