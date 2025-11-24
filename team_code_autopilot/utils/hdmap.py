@@ -109,6 +109,8 @@ class HDMap:
         self._ego_snap = None
         self._vehicle_snaps = []
         self._walker_snaps = []
+        self._vehicle_bboxes_3d = []     # list of bboxes for vehicles
+        self._pedestrian_bboxes_3d = []  # list of bboxes for walkers
 
         # ---------- NEW: A* + route endpoints only ----------
         from team_code_autopilot.utils.astar_planner import AStarPlanner
@@ -426,6 +428,32 @@ class HDMap:
         self._vehicle_snaps = vehicle_snaps
         self._walker_snaps = walker_snaps
 
+        # Compute 3D bounding boxes for vehicles and pedestrians
+        try:
+            if vehicle_snaps:
+                self._vehicle_bboxes_3d = ga.get_vehicle_bbox(
+                    ego_snap,
+                    vehicle_snaps,
+                    radius=self.max_dist,
+                )
+            else:
+                self._vehicle_bboxes_3d = []
+
+            if walker_snaps:
+                self._pedestrian_bboxes_3d = ga.get_vehicle_bbox(
+                    ego_snap,
+                    walker_snaps,
+                    radius=self.max_dist,
+                )
+            else:
+                self._pedestrian_bboxes_3d = []
+        except Exception as e:
+            # Fail gracefully; we don't want bbox errors to break HDMap
+            print(f"[HDMap] Warning: get_vehicle_bbox failed: {e}")
+            self._vehicle_bboxes_3d = []
+            self._pedestrian_bboxes_3d = []
+
+
         # 4) Update masks via frustum
         if any(x is None for x in (self.center_pts, self.divider_pts, self.bound_pts, self.cross_pts, self.idxes)):
             # Should not happen (we parse once in __init__), but guard anyway
@@ -530,6 +558,8 @@ class HDMap:
         curr_wp_world: Optional[np.ndarray] = None, # adding waypoint features
         next_wp_world: Optional[np.ndarray] = None, # adding waypoint features
         path_pts: Optional[np.ndarray] = None,
+        vehicle_bboxes_3d: Optional[list] = None,
+        pedestrian_bboxes_3d: Optional[list] = None,
     ) -> np.ndarray:
         """
         Create an ego-centered HD map image, similar to simple_hdmap_image()
@@ -628,6 +658,73 @@ class HDMap:
                 else:
                     prev_px = None
 
+        def draw_bbox_centers(bboxes, color, half_size_px=4):
+            """
+            Draw simple square bboxes using the center of each 3D bbox.
+
+            Supports:
+              - dict entries from ga.get_vehicle_bbox (with 'corners_world' / 'gt_array')
+              - arrays/lists of corners: (N, 3)
+              - single 3D point: (3,)
+            """
+            if bboxes is None:
+                return
+
+            for bb in bboxes:
+                if bb is None:
+                    continue
+
+                center_world = None
+
+                # ----- Case 1: dict from ga.get_vehicle_bbox -----
+                if isinstance(bb, dict):
+                    # Prefer corners_world if available
+                    if "corners_world" in bb and bb["corners_world"]:
+                        corners = np.asarray(bb["corners_world"], dtype=float)
+                        if corners.ndim == 2 and corners.shape[1] >= 2:
+                            center_world = corners.mean(axis=0)  # (3,)
+                    # Fallback: gt_array (first 3 = x,y,z)
+                    if center_world is None and "gt_array" in bb:
+                        arr = np.asarray(bb["gt_array"], dtype=float)
+                        if arr.size >= 3:
+                            center_world = arr[:3]
+
+                # ----- Case 2: not a dict -> interpret as array-like -----
+                else:
+                    bb_arr = np.asarray(bb, dtype=float)
+
+                    if bb_arr.size == 0:
+                        continue
+
+                    if bb_arr.ndim == 0:
+                        # scalar, no spatial info
+                        continue
+                    elif bb_arr.ndim == 1:
+                        # single 3D point
+                        if bb_arr.shape[0] >= 2:
+                            center_world = bb_arr
+                    else:
+                        # corners (N, 3)
+                        if bb_arr.shape[1] >= 2:
+                            center_world = bb_arr.mean(axis=0)
+
+                # If we still couldn't get a center, skip this bbox
+                if center_world is None:
+                    continue
+
+                # Need at least x, y
+                if len(center_world) < 2:
+                    continue
+
+                ix, iy = world_to_ego_pixel(center_world[0], center_world[1])
+
+                if 0 <= ix < w and 0 <= iy < h:
+                    x1 = int(ix - half_size_px)
+                    y1 = int(iy - half_size_px)
+                    x2 = int(ix + half_size_px)
+                    y2 = int(iy + half_size_px)
+                    cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
+
         # Colors
         color_center  = (0, 255, 255)  # centerline
         color_divider = (0, 255, 0)    # lane divider
@@ -639,6 +736,11 @@ class HDMap:
         draw_points(divider_pts, color_divider, radius=1)
         draw_points(bound_pts,   color_bound,   radius=1)
         draw_points(cross_pts,   color_cross,   radius=1)
+
+        # Vehicles: blue squares
+        draw_bbox_centers(vehicle_bboxes_3d, color=(255, 0, 0), half_size_px=5)
+        # Pedestrians: magenta squares
+        draw_bbox_centers(pedestrian_bboxes_3d, color=(255, 0, 255), half_size_px=4)
 
         # Ego marker at center
         cv2.circle(img, (cx, cy), 3, (0, 0, 255), -1)
@@ -710,6 +812,8 @@ class HDMap:
             curr_wp_world=self._curr_wp_world,
             next_wp_world=self._next_wp_world,
             path_pts=path_pts,
+            vehicle_bboxes_3d=self._vehicle_bboxes_3d,
+            pedestrian_bboxes_3d=self._pedestrian_bboxes_3d,
         )
 
         cv2.imshow("HDMap_Debug", img)
