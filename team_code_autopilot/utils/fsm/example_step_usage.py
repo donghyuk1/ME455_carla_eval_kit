@@ -1,4 +1,4 @@
-from fsm import FSM
+from team_code_autopilot.utils.fsm.fsm_prev import FSM
 
 def on_enter_drive(fsm): print("[enter] Drive")
 def on_exit_drive(fsm):  print("[exit ] Drive")

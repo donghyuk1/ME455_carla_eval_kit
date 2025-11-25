@@ -142,7 +142,10 @@ class HDMap:
         self._right_path_valid: bool = False
         self._left_path_valid: bool = False
  
-
+        # Debug: last local next waypoint chosen by get_next_waypoint()
+        self._debug_next_wp: Optional[np.ndarray] = None
+        self._debug_left_wp: Optional[np.ndarray] = None
+        self._debug_right_wp: Optional[np.ndarray] = None
 
     def __del__(self):
         try:
@@ -682,6 +685,9 @@ class HDMap:
         current_lane_pts: Optional[np.ndarray] = None,
         left_lane_pts: Optional[np.ndarray] = None,
         right_lane_pts: Optional[np.ndarray] = None,
+        debug_next_wp: Optional[np.ndarray] = None,  # adding debug next waypoint feature
+        debug_left_wp: Optional[np.ndarray] = None,  # adding debug left waypoint feature
+        debug_right_wp: Optional[np.ndarray] = None,  # adding debug right waypoint feature
     ) -> np.ndarray:
         """
         Create an ego-centered HD map image, similar to simple_hdmap_image()
@@ -723,17 +729,6 @@ class HDMap:
             ix = int(round(cx + X_body * pixels_per_meter))
             iy = int(round(cy - Y_body * pixels_per_meter))  # forward => up
             return ix, iy
-
-        # def draw_points(pts, color, radius=1):
-        #     if pts is None or len(pts) == 0:
-        #         return
-        #     pts = np.asarray(pts)
-        #     xs = pts[:, 0]
-        #     ys = pts[:, 1]
-        #     for x, y in zip(xs, ys):
-        #         ix, iy = world_to_ego_pixel(x, y)
-        #         if 0 <= ix < w and 0 <= iy < h:
-        #             cv2.circle(img, (ix, iy), radius, color, -1)
 
         def draw_points(pts, color, radius=1):
             """
@@ -853,10 +848,10 @@ class HDMap:
         color_cross   = (255, 0, 255)  # crosswalk
 
         # Draw layers
-        draw_points(center_pts,  color_center,  radius=1)
-        draw_points(divider_pts, color_divider, radius=1)
+        # draw_points(center_pts,  color_center,  radius=1)
+        # draw_points(divider_pts, color_divider, radius=1)
         draw_points(bound_pts,   color_bound,   radius=1)
-        draw_points(cross_pts,   color_cross,   radius=1)
+        # draw_points(cross_pts,   color_cross,   radius=1)
 
         # Vehicles: blue squares
         draw_bbox_centers(vehicle_bboxes_3d, color=(255, 0, 0), half_size_px=5)
@@ -887,25 +882,19 @@ class HDMap:
                 cv2.putText(img, "N", (ix + 4, iy - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-        # if path_pts is not None and len(path_pts) > 1:
-        #     # path_pts is expected to be (M, 3) in world coords (self._local_center_path)
-        #     draw_polyline(path_pts, color=(255, 0, 0), thickness=2)
-        # else:
-        #     print("No path_pts to draw in HD map image.")
-
         # ----- Draw lane centerlines (current / left / right) -----
         # Use thin lines so they don't dominate the HD map
         if current_lane_pts is not None and len(current_lane_pts) > 1:
             # white for current lane
-            draw_polyline(current_lane_pts, color=(255, 255, 255), thickness=1)
+            draw_polyline(current_lane_pts, color=(255, 255, 255), thickness=3)
 
         if left_lane_pts is not None and len(left_lane_pts) > 1:
             # cyan-ish for left lane
-            draw_polyline(left_lane_pts, color=(255, 255, 0), thickness=1)
+            draw_polyline(left_lane_pts, color=(255, 255, 0), thickness=3)
 
         if right_lane_pts is not None and len(right_lane_pts) > 1:
             # yellow-ish for right lane
-            draw_polyline(right_lane_pts, color=(0, 255, 255), thickness=1)
+            draw_polyline(right_lane_pts, color=(0, 255, 255), thickness=3)
 
 
         if path_pts is not None and len(path_pts) > 1:
@@ -928,6 +917,35 @@ class HDMap:
             draw_polyline(path_pts, color=route_color, thickness=2)
         else:
             print("No path_pts to draw in HD map image.")
+
+
+        # ----- Draw debug local next waypoint (from get_next_waypoint) -----
+        if debug_next_wp is not None:
+            debug_next_wp = np.asarray(debug_next_wp, dtype=float).reshape(-1)
+            ix, iy = world_to_ego_pixel(debug_next_wp[0], debug_next_wp[1])
+            if 0 <= ix < w and 0 <= iy < h:
+                # Cyan circle with label "W"
+                cv2.circle(img, (ix, iy), 5, (255, 255, 0), -1)
+                cv2.putText(img, "W", (ix + 4, iy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        # Left lane waypoint: green circle "Wl"
+        if debug_left_wp is not None:
+            p = np.asarray(debug_left_wp, dtype=float).reshape(-1)
+            ix, iy = world_to_ego_pixel(p[0], p[1])
+            if 0 <= ix < w and 0 <= iy < h:
+                cv2.circle(img, (ix, iy), 5, (0, 255, 0), -1)  # green
+                cv2.putText(img, "Wl", (ix + 4, iy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # Right lane waypoint: magenta circle "Wr"
+        if debug_right_wp is not None:
+            p = np.asarray(debug_right_wp, dtype=float).reshape(-1)
+            ix, iy = world_to_ego_pixel(p[0], p[1])
+            if 0 <= ix < w and 0 <= iy < h:
+                cv2.circle(img, (ix, iy), 5, (255, 0, 255), -1)  # magenta
+                cv2.putText(img, "Wr", (ix + 4, iy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
 
         return img
 
@@ -978,6 +996,9 @@ class HDMap:
             current_lane_pts=current_lane_pts,
             left_lane_pts=left_lane_pts,
             right_lane_pts=right_lane_pts,
+            debug_next_wp=self._debug_next_wp,
+            debug_left_wp=self._debug_left_wp,
+            debug_right_wp=self._debug_right_wp,
         )
 
         cv2.imshow("HDMap_Debug", img)
@@ -1143,6 +1164,25 @@ class HDMap:
         self._update_hdmap_info()
         # self._update_waypoint_cursor()
 
+
+        # Optionally refresh local waypoint every tick
+        wp = self.get_next_waypoint(location=None)
+        self._debug_next_wp = np.asarray(wp, dtype=float).reshape(-1)[:3]
+        
+        # Left lane
+        if self._left_path_valid and self._left_lane_path is not None:
+            wp_left = self.get_left_lane_waypoint(location=None)
+            if wp_left is not None:
+                self._debug_left_wp = np.asarray(wp_left, dtype=float).reshape(-1)[:3]
+
+        # Right lane
+        if self._right_path_valid and self._right_lane_path is not None:
+            wp_right = self.get_right_lane_waypoint(location=None)
+            if wp_right is not None:
+                self._debug_right_wp = np.asarray(wp_right, dtype=float).reshape(-1)[:3]
+
+
+
         # NEW: visualize current map + waypoints + route
         if self.is_visualize:
             self._draw_hdmap_debug()
@@ -1205,19 +1245,29 @@ class HDMap:
         self._right_path_valid = False
         self._left_path_valid = False
 
-        # wp_xy is a (2,) numpy array in world coords
-        idx, cluster_pts, dist = self._find_closest_center_cluster(self._next_wp_world)
+        # # wp_xy is a (2,) numpy array in world coords
+        # idx, cluster_pts, dist_curr = self._find_closest_center_cluster(self._next_wp_world)
 
-        if idx >= 0:
-            # cluster_pts is (Mi, 3) – this will be your “local route” to follow
-            self._local_center_path = cluster_pts.copy()
-            self._local_center_path_progress = 0
-            self._path_valid = True
-        else:
-            self._path_valid = False
+        # if idx >= 0:
+        #     # cluster_pts is (Mi, 3) – this will be your “local route” to follow
+        #     self._local_center_path = cluster_pts.copy()
+        #     self._local_center_path_progress = 0
+        #     self._path_valid = True
+        # else:
+        #     self._path_valid = False
+
+        # # Check projection distance for current lane
+        # self._projection_ok = (dist_curr <= self._projection_max_dist)
+
+        curr_idx, curr_cluster_pts, dist_curr = self._find_closest_center_cluster(next_wp_world[:2])
+
+        if curr_idx < 0 or curr_cluster_pts is None or len(curr_cluster_pts) == 0:
+            # No valid current lane found
+            return
 
         # Check projection distance for current lane
         self._projection_ok = (dist_curr <= self._projection_max_dist)
+
 
         # Current lane path == chosen cluster
         self._current_lane_path = curr_cluster_pts.copy()
@@ -1250,89 +1300,303 @@ class HDMap:
             self._right_path_valid = False
 
 
-    def get_next_waypoint(self, location: Optional[Tuple[float, float, float]] = None, lookahead: int = 10) -> np.ndarray:
+
+    def get_next_waypoint(
+        self,
+        location: Optional[Tuple[float, float, float]] = None,
+    ) -> np.ndarray:
         """
-        Returns a single next waypoint from the global sparse path.
+        Returns a single next waypoint from the current lane path.
+
+        - Primary source: self._current_lane_path (clustered lane centerline)
+        - Fallback: self._next_wp_world (global sparse waypoint)
 
         Args:
           location : optional (x,y[,z]) to override ego location for selection
-          lookahead: how far ahead of the cursor to return (clamped)
 
         Returns:
-          waypoint as np.array([x,y,z])
+          waypoint as np.array([x, y, z])
         """
-        if len(self.global_waypoints) == 0:
-            return np.zeros(3)
+
+        # ------------------------------------------------------------------
+        # 1) If current lane path is not ready, fall back to next global wp
+        # ------------------------------------------------------------------
+        if (
+            self._current_lane_path is None
+            or not self._current_path_valid
+            or len(self._current_lane_path) == 0
+        ):
+            if self._next_wp_world is not None:
+                return np.asarray(self._next_wp_world, dtype=float).reshape(-1)[:3]
+            return np.zeros(3, dtype=float)
+
+        path = np.asarray(self._current_lane_path, dtype=float)
+        if path.ndim != 2 or path.shape[0] == 0:
+            if self._next_wp_world is not None:
+                return np.asarray(self._next_wp_world, dtype=float).reshape(-1)[:3]
+            return np.zeros(3, dtype=float)
+
+        # Ensure (N, 3)
+        N = path.shape[0]
+        if path.shape[1] == 2:
+            path = np.concatenate(
+                [path, np.zeros((N, 1), dtype=float)],
+                axis=1
+            )
+
+        # ------------------------------------------------------------------
+        # 2) Ego position + heading
+        # ------------------------------------------------------------------
+        yaw_rad = None
+
 
         if location is not None:
-            loc = np.array(location[:2], dtype=float)
-            idx = self._closest_global_idx_ahead(loc, min_forward_dot=0.0)
+            # Position override from argument
+            loc_arr = np.asarray(location, dtype=float).reshape(-1)
+            ego_xy = loc_arr[:2]
+
+            # Heading from ego_snap or ego actor if available
+            if self._ego_snap is not None:
+                ego_tf = self._ego_snap.get_transform()
+                ego_rot = ego_tf.rotation
+                yaw_rad = math.radians(ego_rot.yaw)
+            elif self.ego is not None:
+                tf = self.ego.get_transform()
+                yaw_rad = math.radians(tf.rotation.yaw)
+
         else:
-            idx = self._wp_idx
+            # No explicit location override -> use ego_snap first, then ego actor
+            if self._ego_snap is not None:
+                ego_tf = self._ego_snap.get_transform()
+                ego_loc = ego_tf.location
+                ego_rot = ego_tf.rotation
 
-        k = int(min(idx + max(1, lookahead), len(self.global_waypoints) - 1))
-        return self.global_waypoints[k]
+                ego_x = ego_loc.x
+                ego_y = ego_loc.y
+                ego_xy = np.array([ego_x, ego_y], dtype=float)
 
-    
-    def get_nextlane_waypoint(self, location: Optional[Tuple[float, float, float]] = None, radius: float = 50.0) -> np.ndarray:
-        """
-        Returns a mid-lane waypoint near/ahead of the ego using visible centerlines.
-        Simple heuristic: choose nearest visible centerline point ahead of ego.
+                yaw_rad = math.radians(ego_rot.yaw)
 
-        Args:
-          location: optional (x,y[,z]) to override ego location
-          radius  : search radius (m)
+            elif self.ego is not None:
+                tf = self.ego.get_transform()
+                ego_xy = np.array([tf.location.x, tf.location.y], dtype=float)
+                yaw_rad = math.radians(tf.rotation.yaw)
 
-        Returns:
-          waypoint as np.array([x,y,z]); falls back to global next if none found
-        """
-        if self.center_pts is None or self.center_mask is None:
-            return self.get_next_waypoint(location)
+            else:
+                # No ego pose at all -> just return first point on the lane
+                return path[0].copy()
 
-        if location is not None:
-            loc3 = np.array(location, dtype=float)
-        elif self._ego_snap is not None:
-            loc3 = np.array([
-                self._ego_snap["location"]["x"],
-                self._ego_snap["location"]["y"],
-                self._ego_snap["location"]["z"],
-            ], dtype=float)
-        else:
-            return self.get_next_waypoint(location)
+        # ------------------------------------------------------------------
+        # 3) Find closest point AHEAD of ego on the lane
+        # ------------------------------------------------------------------
+        rel = path[:, :2] - ego_xy[None, :]          # (N,2)
+        d2 = np.einsum("ij,ij->i", rel, rel)         # squared distance
 
-        visible = self.center_pts[self.center_mask]
-        if len(visible) == 0:
-            return self.get_next_waypoint(location)
+        if yaw_rad is not None:
+            f = np.array([math.cos(yaw_rad), math.sin(yaw_rad)], dtype=float)
+            proj = rel @ f                           # projection onto heading
+            ahead_mask = proj > 2.0                  # 2m in front
 
-        # Filter by radius
-        d2 = np.sum((visible - loc3[None, :])**2, axis=1)
-        keep = d2 <= (radius * radius)
-        if not np.any(keep):
-            # too far; just take closest visible
-            k = int(np.argmin(d2))
-            return visible[k]
-
-        vis_near = visible[keep]
-        d2n = np.sum((vis_near - loc3[None, :])**2, axis=1)
-
-        # Prefer points "ahead" using ego yaw if available
-        if self._ego_snap is not None:
-            ego_yaw = np.radians(self._ego_snap["rotation"]["yaw"])
-            f = np.array([np.cos(ego_yaw), np.sin(ego_yaw)], dtype=float)
-            ahead_mask = []
-            for p in vis_near:
-                dir_xy = p[:2] - loc3[:2]
-                if np.linalg.norm(dir_xy) < 1e-6:
-                    ahead_mask.append(False)
-                else:
-                    ahead_mask.append(np.dot(dir_xy / (np.linalg.norm(dir_xy) + 1e-9), f) > 0)
-            ahead_mask = np.array(ahead_mask, dtype=bool)
             if np.any(ahead_mask):
-                vis_near = vis_near[ahead_mask]
-                d2n = np.sum((vis_near - loc3[None, :])**2, axis=1)
+                d2_ahead = d2[ahead_mask]
+                ahead_indices = np.nonzero(ahead_mask)[0]
+                base_idx = int(ahead_indices[np.argmin(d2_ahead)])
+            else:
+                # Nothing strictly ahead -> take closest point
+                base_idx = int(np.argmin(d2))
+        else:
+            # No heading available -> closest point only
+            base_idx = int(np.argmin(d2))
+        
+        # Update progress so we don't go backwards next time
+        self._local_center_path_progress = base_idx
 
-        k = int(np.argmin(d2n))
-        return vis_near[k]
+        return path[base_idx].copy()
+    
+    def get_right_lane_waypoint(
+        self,
+        location: Optional[Tuple[float, float, float]] = None,
+    ) -> Optional[np.ndarray]:
+        """
+        Returns a single next waypoint from the *right* lane path.
+
+        Returns:
+          waypoint as np.array([x, y, z]) or None if right lane is not valid.
+        """
+        # 1) Check validity of right lane
+        if (
+            self._right_lane_path is None
+            or not self._right_path_valid
+            or len(self._right_lane_path) == 0
+        ):
+            return None
+
+        path = np.asarray(self._right_lane_path, dtype=float)
+        if path.ndim != 2 or path.shape[0] == 0:
+            return None
+
+        # Ensure (N, 3)
+        N = path.shape[0]
+        if path.shape[1] == 2:
+            path = np.concatenate(
+                [path, np.zeros((N, 1), dtype=float)],
+                axis=1
+            )
+
+        # 2) Ego position + heading
+        yaw_rad = None
+
+        if location is not None:
+            # Position override from argument
+            loc_arr = np.asarray(location, dtype=float).reshape(-1)
+            ego_xy = loc_arr[:2]
+
+            # Heading from ego_snap or ego actor if available
+            if self._ego_snap is not None:
+                ego_tf = self._ego_snap.get_transform()
+                ego_rot = ego_tf.rotation
+                yaw_rad = math.radians(ego_rot.yaw)
+            elif self.ego is not None:
+                tf = self.ego.get_transform()
+                yaw_rad = math.radians(tf.rotation.yaw)
+
+        else:
+            # No explicit location override -> use ego_snap first, then ego actor
+            if self._ego_snap is not None:
+                ego_tf = self._ego_snap.get_transform()
+                ego_loc = ego_tf.location
+                ego_rot = ego_tf.rotation
+
+                ego_x = ego_loc.x
+                ego_y = ego_loc.y
+                ego_xy = np.array([ego_x, ego_y], dtype=float)
+
+                yaw_rad = math.radians(ego_rot.yaw)
+
+            elif self.ego is not None:
+                tf = self.ego.get_transform()
+                ego_xy = np.array([tf.location.x, tf.location.y], dtype=float)
+                yaw_rad = math.radians(tf.rotation.yaw)
+
+            else:
+                # No ego pose at all -> just return first point on the lane
+                return path[0].copy()
+
+        # 3) Find closest point AHEAD of ego on the lane
+        rel = path[:, :2] - ego_xy[None, :]          # (N,2)
+        d2 = np.einsum("ij,ij->i", rel, rel)         # squared distance
+
+        if yaw_rad is not None:
+            f = np.array([math.cos(yaw_rad), math.sin(yaw_rad)], dtype=float)
+            proj = rel @ f                           # projection onto heading
+            ahead_mask = proj > 2.0                  # 2m in front
+
+            if np.any(ahead_mask):
+                d2_ahead = d2[ahead_mask]
+                ahead_indices = np.nonzero(ahead_mask)[0]
+                base_idx = int(ahead_indices[np.argmin(d2_ahead)])
+            else:
+                # Nothing strictly ahead -> take closest point
+                base_idx = int(np.argmin(d2))
+        else:
+            # No heading available -> closest point only
+            base_idx = int(np.argmin(d2))
+
+        # No progress tracking for side lanes; just return this point
+        return path[base_idx].copy()
+
+
+    def get_left_lane_waypoint(
+        self,
+        location: Optional[Tuple[float, float, float]] = None,
+    ) -> Optional[np.ndarray]:
+        """
+        Returns a single next waypoint from the *left* lane path.
+
+        Returns:
+          waypoint as np.array([x, y, z]) or None if left lane is not valid.
+        """
+        # 1) Check validity of left lane
+        if (
+            self._left_lane_path is None
+            or not self._left_path_valid
+            or len(self._left_lane_path) == 0
+        ):
+            return None
+
+        path = np.asarray(self._left_lane_path, dtype=float)
+        if path.ndim != 2 or path.shape[0] == 0:
+            return None
+
+        # Ensure (N, 3)
+        N = path.shape[0]
+        if path.shape[1] == 2:
+            path = np.concatenate(
+                [path, np.zeros((N, 1), dtype=float)],
+                axis=1
+            )
+
+        # 2) Ego position + heading
+        yaw_rad = None
+
+        if location is not None:
+            # Position override from argument
+            loc_arr = np.asarray(location, dtype=float).reshape(-1)
+            ego_xy = loc_arr[:2]
+
+            # Heading from ego_snap or ego actor if available
+            if self._ego_snap is not None:
+                ego_tf = self._ego_snap.get_transform()
+                ego_rot = ego_tf.rotation
+                yaw_rad = math.radians(ego_rot.yaw)
+            elif self.ego is not None:
+                tf = self.ego.get_transform()
+                yaw_rad = math.radians(tf.rotation.yaw)
+
+        else:
+            # No explicit location override -> use ego_snap first, then ego actor
+            if self._ego_snap is not None:
+                ego_tf = self._ego_snap.get_transform()
+                ego_loc = ego_tf.location
+                ego_rot = ego_tf.rotation
+
+                ego_x = ego_loc.x
+                ego_y = ego_loc.y
+                ego_xy = np.array([ego_x, ego_y], dtype=float)
+
+                yaw_rad = math.radians(ego_rot.yaw)
+
+            elif self.ego is not None:
+                tf = self.ego.get_transform()
+                ego_xy = np.array([tf.location.x, tf.location.y], dtype=float)
+                yaw_rad = math.radians(tf.rotation.yaw)
+
+            else:
+                # No ego pose at all -> just return first point on the lane
+                return path[0].copy()
+
+        # 3) Find closest point AHEAD of ego on the lane
+        rel = path[:, :2] - ego_xy[None, :]          # (N,2)
+        d2 = np.einsum("ij,ij->i", rel, rel)         # squared distance
+
+        if yaw_rad is not None:
+            f = np.array([math.cos(yaw_rad), math.sin(yaw_rad)], dtype=float)
+            proj = rel @ f                           # projection onto heading
+            ahead_mask = proj > 2.0                  # 2m in front
+
+            if np.any(ahead_mask):
+                d2_ahead = d2[ahead_mask]
+                ahead_indices = np.nonzero(ahead_mask)[0]
+                base_idx = int(ahead_indices[np.argmin(d2_ahead)])
+            else:
+                # Nothing strictly ahead -> take closest point
+                base_idx = int(np.argmin(d2))
+        else:
+            # No heading available -> closest point only
+            base_idx = int(np.argmin(d2))
+
+        # No progress tracking for side lanes; just return this point
+        return path[base_idx].copy()
     
     
     def is_obstacle_in_front(self, distance: float = 10.0, fov_deg: float = 30.0) -> bool:

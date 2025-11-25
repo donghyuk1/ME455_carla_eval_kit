@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from typing import Dict, Any, Optional, Tuple
 
-from team_code_autopilot.utils.fsm import FSM  # adjust import as needed
+from team_code_autopilot.utils.fsm.fsm_prev import FSM  # adjust import as needed
 # -----------------------------------------------------------------------------
 # Cargo schema (convention)
 # -----------------------------------------------------------------------------

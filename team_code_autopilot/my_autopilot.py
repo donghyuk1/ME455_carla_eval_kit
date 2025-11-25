@@ -15,7 +15,7 @@ from utils.hdmap import HDMap
 
 from ultralytics import YOLO
 
-from team_code_autopilot.utils.autopilot_fsm import build_vehicle_fsm
+from team_code_autopilot.utils.fsm.autopilot_fsm import build_vehicle_fsm
 
 def _hfov_to_fx(width_px: int, hfov_deg: float) -> float:
     # Horizontal FoV → focal length (pixels)
@@ -256,7 +256,7 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
 
         # ----------------------------------------------------------
         # FSM: build fsm
-        self.fsm = build_vehicle_fsm(min_stop_s=0.5, start_state="Drive")
+        self.fsm, _ = build_vehicle_fsm(start_state="Drive")
         self.fsm_state = self.fsm.state  # for optional HUD/logging
 
     def _is_cuda_available(self):
@@ -590,20 +590,65 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
                 self._prev_global_wp_world = self._current_global_wp_world
                 self._current_global_wp_world = next_wp_world
 
+        # # -----------------------------------------------------
+        # # HDMap debug: update masks + A* route (for visualization only)
+        # # -----------------------------------------------------
+        # if self.hdmap is not None:
+        #     # 1) Update HDMap internal state (ego pose, masks, etc.)
+        #     self.hdmap.tick()
+        #     self.hdmap.update_route_between_globals(self._prev_global_wp_world, self._current_global_wp_world)
+        # else:
+        #     print("[HDMap] Warning: HDMap utility not initialized; skipping HDMap debug update.")
+
         # -----------------------------------------------------
-        # HDMap debug: update masks + A* route (for visualization only)
+        # 3) HDMap update + local centerline waypoint
         # -----------------------------------------------------
+        hd_wp_xy = None  # waypoint in [north, east]
+
         if self.hdmap is not None:
-            # 1) Update HDMap internal state (ego pose, masks, etc.)
+            # Update HDMap internals (ego pose, masks, etc.)
             self.hdmap.tick()
-            self.hdmap.update_route_between_globals(self._prev_global_wp_world, self._current_global_wp_world)
+
+            # Update local route between prev and current globals
+            self.hdmap.update_route_between_globals(
+                self._prev_global_wp_world,
+                self._current_global_wp_world,
+            )
+
+            # Get next mid-lane waypoint in world frame [x, y, z]
+            hd_wp_world = self.hdmap.get_next_waypoint()
+
+            if hd_wp_world is not None:
+                hd_wp_world = np.asarray(hd_wp_world, dtype=float)
+
+                # Convert world [x, y] back to "map" [north, east]
+                # world_x = east, world_y = -north → north = -world_y, east = world_x
+                hd_north = -hd_wp_world[1]
+                hd_east = hd_wp_world[0]
+                hd_wp_xy = (float(hd_north), float(hd_east))
         else:
-            print("[HDMap] Warning: HDMap utility not initialized; skipping HDMap debug update.")
+            print(
+                "[HDMap] Warning: HDMap not initialized; "
+                "skipping HDMap update and mid-lane waypoint."
+            )
+
+        # -----------------------------------------------------
+        # 4) Choose waypoint for control (HDMap first, fallback: global route)
+        # -----------------------------------------------------
+        if hd_wp_xy is not None:
+            target_n, target_e = hd_wp_xy
+        else:
+            target_n, target_e = float(next_wp[0]), float(next_wp[1])
 
 
-        # Transform next waypoint to ego local frame using compass
-        dn = float(next_wp[0] - pos_xy[0])   # northing (lat)
-        de = float(next_wp[1] - pos_xy[1])   # easting  (lon)
+
+        # # Transform next waypoint to ego local frame using compass
+        # dn = float(next_wp[0] - pos_xy[0])   # northing (lat)
+        # de = float(next_wp[1] - pos_xy[1])   # easting  (lon)
+
+        # Transform chosen waypoint to ego-local frame using compass
+        dn = float(target_n - pos_xy[0])  # northing delta
+        de = float(target_e - pos_xy[1])  # easting  delta
 
         # --- CARLA compass: 0=N, +CW  →  yaw_math: 0=East, +CCW ---
         bearing = float(data['compass'])     # radians
@@ -683,19 +728,50 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
         # -----------------------------------------------------
         # FSM step
         # -----------------------------------------------------
-        cargo = {
-            "obstacle": obstacle,
-            # Hook up traffic light later if you have it:
-            "red": False,
-            "dt": float(self.speed_pid.dt),
-            "speed": v,
-            "timestamp": float(timestamp) if timestamp is not None else float(self.step),
-            # You can add planner info if needed:
-            # "planner_cmd": str(next_cmd),
-        }
-        fsm_state, fsm_info = self.fsm.step(cargo)
-        self.fsm_state = fsm_state  # for optional HUD/logging
+        # cargo = {
+        #     "obstacle": obstacle,
+        #     # Hook up traffic light later if you have it:
+        #     "red": False,
+        #     "dt": float(self.speed_pid.dt),
+        #     "speed": v,
+        #     "timestamp": float(timestamp) if timestamp is not None else float(self.step),
+        #     # You can add planner info if needed:
+        #     # "planner_cmd": str(next_cmd),
+        # }
+        # fsm_state, fsm_info = self.fsm.step(cargo)
+        # self.fsm_state = fsm_state  # for optional HUD/logging
         
+        cargo = {
+            # Time
+            "dt": float(self.speed_pid.dt),
+            "t": float(timestamp) if timestamp is not None else None,
+
+            # Ego state
+            "speed": float(v),
+
+            # Gating signals (for now: only obstacle is wired;
+            # everything else is "no restriction" → always DRIVE)
+            "obstacle_ahead": bool(obstacle),
+            "obstacle_distance": None,          # not used yet
+
+            "tl_red": False,
+            "tl_near_stopline": False,
+
+            "stop_sign_ahead": False,
+            "ss_near_stopline": False,
+
+            # Desired free-flow speed in DRIVE
+            "cruise_target": float(self.target_speed),
+
+            # Optional: FSM can carry a waypoint if you want.
+            # For now we let the HDMap / earlier code pick the target
+            # and only use vec_local for lateral control.
+            "waypoint": None,
+        }
+
+        fsm_state, plan = self.fsm.step(cargo)
+        self.fsm_state = fsm_state  # for HUD/logging
+
 
         steer, throttle_cmd, brake_cmd = 0.0, 0.0, 0.0
 
