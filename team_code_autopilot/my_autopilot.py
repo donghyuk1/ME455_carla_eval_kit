@@ -576,19 +576,20 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
         next_wp_world = np.array([float(next_wp[1]), -float(next_wp[0]), 0.0], dtype=float)
 
 
-        # 3) If this is the first time, just initialize current and skip A*
-        if self._current_global_wp_world is None:
+        # 3) If this is the first time, just initialize
+        if self._prev_global_wp_world is None or self._current_global_wp_world is None:
             self._current_global_wp_world = next_wp_world
-        else:
-            # Check if next_wp changed compared to current_global_wp
-            if not np.allclose(
-                next_wp_world[:2],
-                self._current_global_wp_world[:2],
-                atol=1e-3
-            ):
-                # Waypoint changed → shift current → prev, update current
-                self._prev_global_wp_world = self._current_global_wp_world
-                self._current_global_wp_world = next_wp_world
+            self._prev_global_wp_world = next_wp_world
+
+        # Check if next_wp changed compared to current_global_wp
+        if not np.allclose(
+            next_wp_world[:2],
+            self._current_global_wp_world[:2],
+            atol=1e-3
+        ):
+            # Waypoint changed → shift current → prev, update current
+            self._prev_global_wp_world = self._current_global_wp_world
+            self._current_global_wp_world = next_wp_world
 
         # # -----------------------------------------------------
         # # HDMap debug: update masks + A* route (for visualization only)

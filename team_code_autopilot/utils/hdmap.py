@@ -1225,17 +1225,6 @@ class HDMap:
         curr_wp_world = np.asarray(curr_wp_world, dtype=float).reshape(-1)
         next_wp_world = np.asarray(next_wp_world, dtype=float).reshape(-1)
 
-        # 2) if pair unchanged (within small tolerance), skip recomputing
-        if (
-            self._last_curr_wp_world is not None
-            and self._last_next_wp_world is not None
-            and np.allclose(curr_wp_world, self._last_curr_wp_world, atol=1e-3)
-            and np.allclose(next_wp_world, self._last_next_wp_world, atol=1e-3)
-            and self.has_valid_local_path
-        ):
-            # nothing changed; keep existing path
-            return
-
         # # Remember this pair
         self._curr_wp_world = curr_wp_world
         self._next_wp_world = next_wp_world
@@ -1259,30 +1248,65 @@ class HDMap:
         # # Check projection distance for current lane
         # self._projection_ok = (dist_curr <= self._projection_max_dist)
 
-        curr_idx, curr_cluster_pts, dist_curr = self._find_closest_center_cluster(next_wp_world[:2])
+        curr_idx, curr_cluster_pts, dist_curr = self._find_closest_center_cluster(
+            curr_wp_world[:2]
+        )
+        next_idx, next_cluster_pts, dist_next = self._find_closest_center_cluster(
+            next_wp_world[:2]
+        )
 
-        if curr_idx < 0 or curr_cluster_pts is None or len(curr_cluster_pts) == 0:
-            # No valid current lane found
+        # Decide which anchor (curr or next) to use
+        base_idx = -1
+        base_pts = None
+        base_dist = np.inf
+        base_ref_xy = None
+
+        if curr_idx >= 0 and curr_cluster_pts is not None and len(curr_cluster_pts) > 0:
+            base_idx = curr_idx
+            base_pts = curr_cluster_pts
+            base_dist = dist_curr
+            base_ref_xy = curr_wp_world[:2]
+
+        if next_idx >= 0 and next_cluster_pts is not None and len(next_cluster_pts) > 0:
+            if base_pts is None or dist_next < base_dist:
+                base_idx = next_idx
+                base_pts = next_cluster_pts
+                base_dist = dist_next
+                base_ref_xy = next_wp_world[:2]
+
+        # If nothing valid found around either waypoint → clear and bail
+        if base_idx < 0 or base_pts is None or len(base_pts) == 0:
+            self._current_lane_path = None
+            self._left_lane_path = None
+            self._right_lane_path = None
+
+            self._current_path_valid = False
+            self._left_path_valid = False
+            self._right_path_valid = False
+
+            self._local_center_path = None
+            self._local_center_path_progress = 0
+            self._path_valid = False
+            self._projection_ok = False
             return
 
-        # Check projection distance for current lane
-        self._projection_ok = (dist_curr <= self._projection_max_dist)
-
+        # Check projection distance for chosen lane
+        self._projection_ok = (base_dist <= self._projection_max_dist)
 
         # Current lane path == chosen cluster
-        self._current_lane_path = curr_cluster_pts.copy()
+        self._current_lane_path = np.asarray(base_pts, dtype=float).copy()
         self._current_path_valid = self._projection_ok
 
         # For backward compatibility, use current lane as "local path"
-        self._local_center_path = curr_cluster_pts.copy()
+        self._local_center_path = self._current_lane_path.copy()
         self._local_center_path_progress = 0
         self._path_valid = self._projection_ok
 
-        # 4) Estimate left / right neighbor lanes around curr_wp_world
+        # 4) Estimate left / right neighbor lanes around chosen anchor
         left_seg, right_seg = self._find_neighbor_lanes(
-            curr_cluster_idx=curr_idx,
-            curr_cluster_pts=curr_cluster_pts,
-            ref_point_xy=curr_wp_world[:2],
+            curr_cluster_idx=base_idx,
+            curr_cluster_pts=self._current_lane_path,
+            ref_point_xy=base_ref_xy,
         )
 
         if left_seg is not None and len(left_seg) > 0:
@@ -1298,6 +1322,48 @@ class HDMap:
         else:
             self._right_lane_path = None
             self._right_path_valid = False
+
+        # curr_idx, curr_cluster_pts, dist_curr = self._find_closest_center_cluster(next_wp_world[:2])
+        # next_idx, next_cluster_pts, dist_next = self._find_closest_center_cluster(next_wp_world[:2])
+        
+
+        # if curr_idx < 0 or curr_cluster_pts is None or len(curr_cluster_pts) == 0:
+        #     # No valid current lane found
+        #     return
+
+        # # Check projection distance for current lane
+        # self._projection_ok = (dist_curr <= self._projection_max_dist)
+
+
+        # # Current lane path == chosen cluster
+        # self._current_lane_path = curr_cluster_pts.copy()
+        # self._current_path_valid = self._projection_ok
+
+        # # For backward compatibility, use current lane as "local path"
+        # self._local_center_path = curr_cluster_pts.copy()
+        # self._local_center_path_progress = 0
+        # self._path_valid = self._projection_ok
+
+        # # 4) Estimate left / right neighbor lanes around curr_wp_world
+        # left_seg, right_seg = self._find_neighbor_lanes(
+        #     curr_cluster_idx=curr_idx,
+        #     curr_cluster_pts=curr_cluster_pts,
+        #     ref_point_xy=curr_wp_world[:2],
+        # )
+
+        # if left_seg is not None and len(left_seg) > 0:
+        #     self._left_lane_path = np.asarray(left_seg, dtype=float).copy()
+        #     self._left_path_valid = True
+        # else:
+        #     self._left_lane_path = None
+        #     self._left_path_valid = False
+
+        # if right_seg is not None and len(right_seg) > 0:
+        #     self._right_lane_path = np.asarray(right_seg, dtype=float).copy()
+        #     self._right_path_valid = True
+        # else:
+        #     self._right_lane_path = None
+        #     self._right_path_valid = False
 
 
 
