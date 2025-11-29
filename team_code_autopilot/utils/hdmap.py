@@ -83,7 +83,8 @@ class HDMap:
         self.camera_units = []
         self.sensors = []  # for cleanup
 
-
+        self.ego_xy = None
+        self.ego_yaw = None
 
         # Parsed OpenDRIVE polylines (static)
         self.center_pts: Optional[np.ndarray] = None
@@ -302,21 +303,87 @@ class HDMap:
         return grouped
 
 
+    # def _find_closest_center_cluster(
+    #     self,
+    #     location_xy: np.ndarray,
+    # ):
+    #     """
+    #     Given a 2D world location (x, y), find the closest centerline cluster.
+
+    #     Uses self.center_mask_clustered, which is a list of (Mi, 3) arrays
+    #     returned by _group_points_by_id(...).
+
+    #     Args:
+    #         location_xy: np.ndarray shape (2,) or (3,), world-frame (x, y [, z])
+
+    #     Returns:
+    #         (best_idx, best_cluster_pts, best_dist)
+
+    #         best_idx:
+    #             - index into self.center_mask_clustered
+    #             - -1 if not found / no clusters
+    #         best_cluster_pts:
+    #             - (Mi, 3) np.ndarray of the chosen cluster
+    #             - None if no cluster found
+    #         best_dist:
+    #             - minimal Euclidean distance [m] from location_xy to any point in that cluster
+    #             - float("inf") if no cluster found
+    #     """
+    #     # Normalize input location to [x, y]
+    #     loc = np.asarray(location_xy, dtype=float).reshape(-1)
+    #     if loc.size >= 2:
+    #         loc_xy = loc[:2]
+    #     else:
+    #         raise ValueError("location_xy must have at least 2 elements (x, y).")
+
+    #     # Make sure clusters exist
+    #     clusters = getattr(self, "center_mask_clustered", None)
+    #     if clusters is None or len(clusters) == 0:
+    #         print("[HDMap] Warning: center_mask_clustered is empty; cannot find closest cluster.")
+    #         return -1, None, float("inf")
+
+    #     best_idx = -1
+    #     best_d2 = float("inf")
+    #     best_cluster = None
+
+    #     for i, seg in enumerate(clusters):
+    #         if seg is None or len(seg) == 0:
+    #             continue
+
+    #         seg = np.asarray(seg)
+    #         # seg is (Mi, 3) -> take XY
+    #         seg_xy = seg[:, :2]
+
+    #         diff = seg_xy - loc_xy[None, :]
+    #         d2 = np.einsum("ij,ij->i", diff, diff)
+    #         local_min = float(d2.min())
+
+    #         if local_min < best_d2:
+    #             best_d2 = local_min
+    #             best_idx = i
+    #             best_cluster = seg
+
+    #     if best_idx < 0:
+    #         return -1, None, float("inf")
+
+    #     return best_idx, best_cluster, math.sqrt(best_d2)
     def _find_closest_center_cluster(
         self,
-        location_xy: np.ndarray,
+        wp_xy: np.ndarray,
+        ego_xy: np.ndarray,
     ):
         """
-        Given a 2D world location (x, y), find the closest centerline cluster.
+        Given a waypoint and the ego position (both in world XY),
+        find the centerline cluster that is jointly close to BOTH.
 
-        Uses self.center_mask_clustered, which is a list of (Mi, 3) arrays
-        returned by _group_points_by_id(...).
+        Uses self.center_mask_clustered, which is a list of (Mi, 3) arrays.
 
         Args:
-            location_xy: np.ndarray shape (2,) or (3,), world-frame (x, y [, z])
+            wp_xy:  np.ndarray shape (2,) or (3,), world-frame (x, y [, z])
+            ego_xy: np.ndarray shape (2,) or (3,), world-frame (x, y [, z])
 
         Returns:
-            (best_idx, best_cluster_pts, best_dist)
+            (best_idx, best_cluster_pts, dist_wp, dist_ego)
 
             best_idx:
                 - index into self.center_mask_clustered
@@ -324,49 +391,64 @@ class HDMap:
             best_cluster_pts:
                 - (Mi, 3) np.ndarray of the chosen cluster
                 - None if no cluster found
-            best_dist:
-                - minimal Euclidean distance [m] from location_xy to any point in that cluster
-                - float("inf") if no cluster found
+            dist_wp:
+                - minimal Euclidean distance [m] from wp_xy to any point in that cluster
+            dist_ego:
+                - minimal Euclidean distance [m] from ego_xy to any point in that cluster
         """
-        # Normalize input location to [x, y]
-        loc = np.asarray(location_xy, dtype=float).reshape(-1)
-        if loc.size >= 2:
-            loc_xy = loc[:2]
-        else:
-            raise ValueError("location_xy must have at least 2 elements (x, y).")
 
-        # Make sure clusters exist
+        # Normalize inputs to [x, y]
+        wp = np.asarray(wp_xy, dtype=float).reshape(-1)
+        ego = np.asarray(ego_xy, dtype=float).reshape(-1)
+
+        if wp.size < 2 or ego.size < 2:
+            raise ValueError("wp_xy and ego_xy must have at least 2 elements (x, y).")
+
+        wp_xy = wp[:2]
+        ego_xy = ego[:2]
+
         clusters = getattr(self, "center_mask_clustered", None)
         if clusters is None or len(clusters) == 0:
             print("[HDMap] Warning: center_mask_clustered is empty; cannot find closest cluster.")
-            return -1, None, float("inf")
+            return -1, None, float("inf"), float("inf")
 
         best_idx = -1
-        best_d2 = float("inf")
         best_cluster = None
+        best_d2_wp = float("inf")
+        best_d2_ego = float("inf")
+        best_score = float("inf")  # score = max(d2_wp, d2_ego)
 
         for i, seg in enumerate(clusters):
             if seg is None or len(seg) == 0:
                 continue
 
-            seg = np.asarray(seg)
-            # seg is (Mi, 3) -> take XY
-            seg_xy = seg[:, :2]
+            seg = np.asarray(seg, dtype=float)
+            seg_xy = seg[:, :2]  # (Mi, 2)
 
-            diff = seg_xy - loc_xy[None, :]
-            d2 = np.einsum("ij,ij->i", diff, diff)
-            local_min = float(d2.min())
+            # Distances to waypoint
+            diff_wp = seg_xy - wp_xy[None, :]
+            d2_wp_all = np.einsum("ij,ij->i", diff_wp, diff_wp)
+            local_min_wp = float(d2_wp_all.min())
 
-            if local_min < best_d2:
-                best_d2 = local_min
+            # Distances to ego
+            diff_ego = seg_xy - ego_xy[None, :]
+            d2_ego_all = np.einsum("ij,ij->i", diff_ego, diff_ego)
+            local_min_ego = float(d2_ego_all.min())
+
+            # Combined score: “good for both waypoint and ego”
+            score = max(local_min_wp, local_min_ego)
+
+            if score < best_score:
+                best_score = score
                 best_idx = i
                 best_cluster = seg
+                best_d2_wp = local_min_wp
+                best_d2_ego = local_min_ego
 
         if best_idx < 0:
-            return -1, None, float("inf")
+            return -1, None, float("inf"), float("inf")
 
-        return best_idx, best_cluster, math.sqrt(best_d2)
-
+        return best_idx, best_cluster, math.sqrt(best_d2_wp), math.sqrt(best_d2_ego)
 
     def _find_neighbor_lanes(
         self,
@@ -611,6 +693,15 @@ class HDMap:
         self.cross_mask = cross_mask
 
 
+        # update ego information
+        ego_tf = ego_snap.get_transform()
+        ego_loc = ego_tf.location
+        ego_rot = ego_tf.rotation
+
+        self.ego_xy = np.array([ego_loc.x, ego_loc.y], dtype=float)
+        self.ego_yaw = math.radians(float(ego_rot.yaw))
+
+
     def _update_waypoint_cursor(self):
         """Maintain a simple forward-moving cursor along global sparse waypoints."""
         if self._ego_snap is None or len(self.global_waypoints) == 0:
@@ -627,46 +718,6 @@ class HDMap:
             if (self._wp_idx - idx) > 20:
                 self._wp_idx = idx
 
-
-    def _ensure_astar_planner(self):
-        """Lazily create A* planner over center_pts XY."""
-        if self._astar_planner is not None:
-            return
-
-        if self.center_pts is None or len(self.center_pts) == 0:
-            self._prepare_hdmap_points()
-
-        if self.center_pts is None or len(self.center_pts) == 0:
-            return
-
-        # center_xy = self.center_pts[:, :2].astype(np.float32)
-        center_xy = self.center_pts[:, :2].astype(np.float32) 
-        self._astar_planner = self._AStarPlannerClass(
-            points=center_xy,
-            neighbor_radius=self._astar_neighbor_radius,
-            heuristic_weight=2.0,
-        )
-
-
-    def _project_to_center_idx(self, wp_xy: np.ndarray) -> Tuple[int, float]:
-        """
-        Project a world waypoint (x,y) to the nearest center_pts node.
-
-        Returns:
-            (idx, dist) where idx is index into self.center_pts, dist in meters.
-            If center_pts is empty, returns (-1, inf).
-        """
-        if self.center_pts is None or len(self.center_pts) == 0:
-            print("[HDMap] Warning: center_pts is empty; cannot project waypoint.")
-            return -1, float("inf")
-
-        center_xy = self.center_pts[:, :2]  # (N, 2)
-        diff = center_xy - wp_xy[None, :]
-        d2 = np.einsum("ij,ij->i", diff, diff)
-        k = int(np.argmin(d2))
-        d = float(np.sqrt(d2[k]))
-        return k, d
-    
 
     def _make_hdmap_image_ego(
         self,
@@ -1194,88 +1245,24 @@ class HDMap:
         next_wp_world: Optional[np.ndarray],
     ) -> None:
         """
-        Update the A* path between two global waypoints in WORLD coordinates.
+        Update lane paths (current / left / right) given two global waypoints
+        in WORLD coordinates.
 
-        Arguments:
-          curr_wp_world : np.array([x,y,z]) or None
-          next_wp_world : np.array([x,y,z]) or None
-
-        Behavior:
-          - If next_wp_world is None -> do NOT update; keep existing path.
-          - If (curr_wp_world, next_wp_world) is unchanged (within tolerance),
-            do NOT recompute A*.
-          - Otherwise:
-              * project both to nearest center_pts (XY)
-              * if either is farther than projection_max_dist -> mark failure
-              * else run A* between those two center_pts nodes and store path.
+        Logic:
+        - If next_wp_world is None: do nothing.
+        - If curr_wp_world is None: clear paths & bail.
+        - Uses ego pose (self.ego_xy) and:
+                _find_closest_center_cluster(curr_wp_xy, ego_xy)
+                _find_closest_center_cluster(next_wp_xy, ego_xy)
+            and picks the cluster that is closer to ego_xy.
         """
-        # 1) no next waypoint => nothing to update
+        import numpy as np
+
+        # 1) basic checks
         if next_wp_world is None:
             return
 
         if curr_wp_world is None:
-            # can't define a segment if we don't know the current wp
-            self._path_valid = False
-            self._projection_ok = False
-            self._local_center_path = None
-            self._local_center_path_progress = 0
-            return
-
-        # # Normalize to np.array shape (3,)
-        curr_wp_world = np.asarray(curr_wp_world, dtype=float).reshape(-1)
-        next_wp_world = np.asarray(next_wp_world, dtype=float).reshape(-1)
-
-        # # Remember this pair
-        self._curr_wp_world = curr_wp_world
-        self._next_wp_world = next_wp_world
-        self._last_curr_wp_world = curr_wp_world.copy()
-        self._last_next_wp_world = next_wp_world.copy()
-        self._current_path_valid = False
-        self._right_path_valid = False
-        self._left_path_valid = False
-
-        # # wp_xy is a (2,) numpy array in world coords
-        # idx, cluster_pts, dist_curr = self._find_closest_center_cluster(self._next_wp_world)
-
-        # if idx >= 0:
-        #     # cluster_pts is (Mi, 3) – this will be your “local route” to follow
-        #     self._local_center_path = cluster_pts.copy()
-        #     self._local_center_path_progress = 0
-        #     self._path_valid = True
-        # else:
-        #     self._path_valid = False
-
-        # # Check projection distance for current lane
-        # self._projection_ok = (dist_curr <= self._projection_max_dist)
-
-        curr_idx, curr_cluster_pts, dist_curr = self._find_closest_center_cluster(
-            curr_wp_world[:2]
-        )
-        next_idx, next_cluster_pts, dist_next = self._find_closest_center_cluster(
-            next_wp_world[:2]
-        )
-
-        # Decide which anchor (curr or next) to use
-        base_idx = -1
-        base_pts = None
-        base_dist = np.inf
-        base_ref_xy = None
-
-        if curr_idx >= 0 and curr_cluster_pts is not None and len(curr_cluster_pts) > 0:
-            base_idx = curr_idx
-            base_pts = curr_cluster_pts
-            base_dist = dist_curr
-            base_ref_xy = curr_wp_world[:2]
-
-        if next_idx >= 0 and next_cluster_pts is not None and len(next_cluster_pts) > 0:
-            if base_pts is None or dist_next < base_dist:
-                base_idx = next_idx
-                base_pts = next_cluster_pts
-                base_dist = dist_next
-                base_ref_xy = next_wp_world[:2]
-
-        # If nothing valid found around either waypoint → clear and bail
-        if base_idx < 0 or base_pts is None or len(base_pts) == 0:
             self._current_lane_path = None
             self._left_lane_path = None
             self._right_lane_path = None
@@ -1290,23 +1277,127 @@ class HDMap:
             self._projection_ok = False
             return
 
-        # Check projection distance for chosen lane
-        self._projection_ok = (base_dist <= self._projection_max_dist)
+        # Normalize to np.array shape (3,)
+        curr_wp_world = np.asarray(curr_wp_world, dtype=float).reshape(-1)
+        next_wp_world = np.asarray(next_wp_world, dtype=float).reshape(-1)
 
-        # Current lane path == chosen cluster
+        # Store for debug / visualization
+        self._curr_wp_world = curr_wp_world
+        self._next_wp_world = next_wp_world
+        self._last_curr_wp_world = curr_wp_world.copy()
+        self._last_next_wp_world = next_wp_world.copy()
+
+        # Reset validity flags
+        self._current_path_valid = False
+        self._left_path_valid = False
+        self._right_path_valid = False
+
+        # Need ego pose
+        ego_xy = None
+        if self.ego_xy is not None:
+            ego_xy = np.asarray(self.ego_xy, dtype=float).reshape(2)
+
+        if ego_xy is None:
+            # No ego pose yet → we can't use the "closest to ego" logic.
+            # Safe fallback: clear and bail.
+            self._current_lane_path = None
+            self._left_lane_path = None
+            self._right_lane_path = None
+
+            self._current_path_valid = False
+            self._left_path_valid = False
+            self._right_path_valid = False
+
+            self._local_center_path = None
+            self._local_center_path_progress = 0
+            self._path_valid = False
+            self._projection_ok = False
+            return
+
+        # --------------------------------------------------
+        # 2) Find best cluster for (curr_wp, ego) and (next_wp, ego)
+        # --------------------------------------------------
+        curr_idx, curr_cluster_pts, dist_curr_wp, dist_curr_ego = self._find_closest_center_cluster(
+            curr_wp_world[:2],
+            ego_xy,
+        )
+
+        next_idx, next_cluster_pts, dist_next_wp, dist_next_ego = self._find_closest_center_cluster(
+            next_wp_world[:2],
+            ego_xy,
+        )
+
+        curr_valid = (curr_idx >= 0 and curr_cluster_pts is not None and len(curr_cluster_pts) > 0)
+        next_valid = (next_idx >= 0 and next_cluster_pts is not None and len(next_cluster_pts) > 0)
+
+        # --------------------------------------------------
+        # 3) Choose which cluster to use
+        # --------------------------------------------------
+        if not curr_valid and not next_valid:
+            self._current_lane_path = None
+            self._left_lane_path = None
+            self._right_lane_path = None
+
+            self._current_path_valid = False
+            self._left_path_valid = False
+            self._right_path_valid = False
+
+            self._local_center_path = None
+            self._local_center_path_progress = 0
+            self._path_valid = False
+            self._projection_ok = False
+            return
+
+        if curr_valid and not next_valid:
+            base_idx = curr_idx
+            base_pts = curr_cluster_pts
+            base_dist_wp = dist_curr_wp
+            base_dist_ego = dist_curr_ego
+
+        elif next_valid and not curr_valid:
+            base_idx = next_idx
+            base_pts = next_cluster_pts
+            base_dist_wp = dist_next_wp
+            base_dist_ego = dist_next_ego
+
+        else:
+            # both valid → pick the one whose cluster is closer to ego
+            if dist_curr_ego <= dist_next_ego:
+                base_idx = curr_idx
+                base_pts = curr_cluster_pts
+                base_dist_wp = dist_curr_wp
+                base_dist_ego = dist_curr_ego
+            else:
+                base_idx = next_idx
+                base_pts = next_cluster_pts
+                base_dist_wp = dist_next_wp
+                base_dist_ego = dist_next_ego
+
+        # --------------------------------------------------
+        # 4) Projection quality and set current lane
+        # --------------------------------------------------
+        # Require both waypoint and ego to be reasonably close to this cluster
+        self._projection_ok = (
+            (base_dist_wp  <= self._projection_max_dist) and
+            (base_dist_ego <= self._projection_max_dist)
+        )
+
         self._current_lane_path = np.asarray(base_pts, dtype=float).copy()
         self._current_path_valid = self._projection_ok
 
-        # For backward compatibility, use current lane as "local path"
+        # For backward compatibility:
         self._local_center_path = self._current_lane_path.copy()
         self._local_center_path_progress = 0
         self._path_valid = self._projection_ok
 
-        # 4) Estimate left / right neighbor lanes around chosen anchor
+        # --------------------------------------------------
+        # 5) Left / right neighbor lanes using chosen cluster,
+        #    anchored around the ego pose
+        # --------------------------------------------------
         left_seg, right_seg = self._find_neighbor_lanes(
             curr_cluster_idx=base_idx,
             curr_cluster_pts=self._current_lane_path,
-            ref_point_xy=base_ref_xy,
+            ref_point_xy=ego_xy,
         )
 
         if left_seg is not None and len(left_seg) > 0:
@@ -1322,49 +1413,6 @@ class HDMap:
         else:
             self._right_lane_path = None
             self._right_path_valid = False
-
-        # curr_idx, curr_cluster_pts, dist_curr = self._find_closest_center_cluster(next_wp_world[:2])
-        # next_idx, next_cluster_pts, dist_next = self._find_closest_center_cluster(next_wp_world[:2])
-        
-
-        # if curr_idx < 0 or curr_cluster_pts is None or len(curr_cluster_pts) == 0:
-        #     # No valid current lane found
-        #     return
-
-        # # Check projection distance for current lane
-        # self._projection_ok = (dist_curr <= self._projection_max_dist)
-
-
-        # # Current lane path == chosen cluster
-        # self._current_lane_path = curr_cluster_pts.copy()
-        # self._current_path_valid = self._projection_ok
-
-        # # For backward compatibility, use current lane as "local path"
-        # self._local_center_path = curr_cluster_pts.copy()
-        # self._local_center_path_progress = 0
-        # self._path_valid = self._projection_ok
-
-        # # 4) Estimate left / right neighbor lanes around curr_wp_world
-        # left_seg, right_seg = self._find_neighbor_lanes(
-        #     curr_cluster_idx=curr_idx,
-        #     curr_cluster_pts=curr_cluster_pts,
-        #     ref_point_xy=curr_wp_world[:2],
-        # )
-
-        # if left_seg is not None and len(left_seg) > 0:
-        #     self._left_lane_path = np.asarray(left_seg, dtype=float).copy()
-        #     self._left_path_valid = True
-        # else:
-        #     self._left_lane_path = None
-        #     self._left_path_valid = False
-
-        # if right_seg is not None and len(right_seg) > 0:
-        #     self._right_lane_path = np.asarray(right_seg, dtype=float).copy()
-        #     self._right_path_valid = True
-        # else:
-        #     self._right_lane_path = None
-        #     self._right_path_valid = False
-
 
 
     def get_next_waypoint(
@@ -1664,39 +1712,117 @@ class HDMap:
         # No progress tracking for side lanes; just return this point
         return path[base_idx].copy()
     
-    
-    def is_obstacle_in_front(self, distance: float = 10.0, fov_deg: float = 30.0) -> bool:
+        
+    def is_obstacle_in_front(
+        self,
+        distance: float = 10.0,
+        fov_deg: float = 30.0,
+        margin: float = 0.5,
+    ) -> bool:
         """
-        Naive obstacle check: any vehicle/walker within a forward cone?
+        Check if there is any obstacle (vehicle bbox) in front of the ego
+        along the *current lane path* within a given look-ahead distance
+        and field-of-view.
+
+        Uses:
+        - self._current_lane_path: (N, 3) centerline points in world XY
+        - self._current_path_valid: bool
+        - self._ego_xy: (2,) ego position in world XY
+        - self._ego_yaw: float, ego yaw in radians (0=+x, CCW)
+        - self._obstacle_bboxes: list of bbox dicts (ga.get_vehicle_bbox-style)
+
+        Returns:
+        True if any bbox overlaps the forward portion of the lane path.
         """
-        if self._ego_snap is None:
+        # ------------------------------------------------------------
+        # 1) Sanity checks: need a valid lane path and ego pose
+        # ------------------------------------------------------------
+        if not getattr(self, "_current_path_valid", False):
+            # No lane → we can't reason about "ahead"; be conservative or just False
             return False
 
-        ex, ey = self._ego_snap["location"]["x"], self._ego_snap["location"]["y"]
-        ego_yaw = np.radians(self._ego_snap["rotation"]["yaw"])
-        f = np.array([np.cos(ego_yaw), np.sin(ego_yaw)], dtype=float)
+        if not hasattr(self, "_current_lane_path") or self._current_lane_path is None:
+            return False
 
-        half_cos = np.cos(np.radians(fov_deg) / 2.0)
-        dmax2 = distance * distance
+        lane = np.asarray(self._current_lane_path, dtype=float)
+        if lane.ndim != 2 or lane.shape[0] == 0:
+            return False
 
-        def _in_front(px, py):
-            v = np.array([px - ex, py - ey], dtype=float)
-            d2 = float(np.dot(v, v))
-            if d2 > dmax2 or d2 < 1e-6:
-                return False
-            v /= (np.sqrt(d2) + 1e-9)
-            return float(np.dot(v, f)) >= half_cos
+        if not hasattr(self, "_ego_xy") or not hasattr(self, "_ego_yaw"):
+            # ego pose not set; you should fill these in tick()
+            return False
 
-        # vehicles
-        for vs in self._vehicle_snaps:
-            loc = vs["location"]
-            if _in_front(loc["x"], loc["y"]):
-                return True
+        ego_xy = np.asarray(self._ego_xy, dtype=float).reshape(2)
+        yaw = float(self._ego_yaw)
 
-        # walkers
-        for ws in self._walker_snaps:
-            loc = ws["location"]
-            if _in_front(loc["x"], loc["y"]):
+        # ------------------------------------------------------------
+        # 2) Extract the portion of the lane *ahead* of ego
+        #    within 'distance' and 'fov_deg'
+        # ------------------------------------------------------------
+        lane_xy = lane[:, :2]  # (N, 2)
+
+        # Find closest lane point to ego → anchor index
+        diff = lane_xy - ego_xy[None, :]
+        d2 = np.einsum("ij,ij->i", diff, diff)
+        i0 = int(np.argmin(d2))
+
+        # Forward direction unit vector in world XY
+        fwd = np.array([math.cos(yaw), math.sin(yaw)], dtype=float)
+
+        # Collect lane points ahead of ego, capped by arc-length and FOV
+        forward_pts = []
+        accum_dist = 0.0
+        last_xy = lane_xy[i0]
+
+        half_fov = float(fov_deg) * 0.5 * math.pi / 180.0  # radians
+
+        for k in range(i0, lane_xy.shape[0]):
+            p_xy = lane_xy[k]
+
+            # Vector from ego to this point
+            v = p_xy - ego_xy
+            norm_v = np.linalg.norm(v)
+            if norm_v < 1e-3:
+                # basically at ego position; include and continue
+                angle_ok = True
+            else:
+                # angle between forward and v
+                cosang = float(np.dot(v / norm_v, fwd))
+                cosang = max(-1.0, min(1.0, cosang))
+                ang = math.acos(cosang)
+                angle_ok = (ang <= half_fov)
+
+            if not angle_ok:
+                continue  # outside FOV → skip
+
+            # Accumulate arc-length *along the lane*
+            if k > i0:
+                ds = float(np.linalg.norm(p_xy - last_xy))
+                accum_dist += ds
+                last_xy = p_xy
+
+            if accum_dist > distance:
+                break
+
+            forward_pts.append(lane[k])
+
+        if len(forward_pts) == 0:
+            # No lane segment ahead in FOV/distance
+            return False
+
+        route_slice = np.vstack(forward_pts)  # (M, 3)
+
+        # ------------------------------------------------------------
+        # 3) Check each obstacle bbox for overlap with the route_slice
+        # ------------------------------------------------------------
+        bboxes = getattr(self, "_obstacle_bboxes", None)
+        if not bboxes:
+            return False  # no obstacles known
+
+        for bbox in bboxes:
+            if bbox is None:
+                continue
+            if self._route_overlaps_bbox(route_slice, bbox, margin=margin):
                 return True
 
         return False
@@ -1705,12 +1831,13 @@ class HDMap:
     def is_nextlane_free(self, distance: float = 20.0, clearance: float = 3.0) -> bool:
         # Check if the next-lane waypoint is free of obstacles within given distance.
         # Simple circular clearance check.
-        pass
+        return True
 
     
     def is_traffic_light_red(self):
         # Check if the traffic light in front of the ego vehicle is red
-        pass
+        return False
+    
 
 
 

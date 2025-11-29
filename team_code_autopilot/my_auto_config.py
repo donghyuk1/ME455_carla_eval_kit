@@ -19,7 +19,7 @@ class MyAutoConfig:
     route_planner_max_distance = 20.0
 
     # Control
-    target_speed = 12.0  
+    target_speed = 5.0  
     steer_gain   = 0.5
     steer_damping = 0.9
 
@@ -32,7 +32,7 @@ class MyAutoConfig:
 
     # Safety box
     safety_x_min = 1.0               # start of forward safety zone (meters ahead of ego)
-    safety_x_max = 10.0               # end of forward safety zone → stop if obstacle within this distance
+    safety_x_max = 5.0               # end of forward safety zone → stop if obstacle within this distance
     safety_y_abs = 1.2               # half-width of safety zone (meters to left/right from centerline)
     safety_z_min = -1.5              # lower vertical bound (filters ground points below car)
     safety_z_max = 1.0               # upper vertical bound (ignores high clutter like trees, signs)
