@@ -11,7 +11,7 @@ import math
 from leaderboard.autoagents import autonomous_agent
 from my_auto_config import MyAutoConfig
 
-from utils.hdmap import HDMap
+from team_code_autopilot.utils.hdmap import HDMap
 
 from utils.traffic_light_detector import TrafficLightDetector
 
@@ -26,7 +26,7 @@ from team_code_autopilot.fsm.autopilot_fsm import (
 # Entry point
 # =============================================================
 def get_entry_point():
-    return 'MyAutopilot'
+    return 'MyAutopilot'  
 
 
 # =============================================================

@@ -11,23 +11,14 @@ import weakref
 from typing import Optional, Tuple, List
 import numpy as np
 import carla
+import cv2
 
-import zmq
-import matplotlib
-matplotlib.use('Agg')  # use non-interactive backend
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-from io import BytesIO
-
-# --- ZMQ Publisher Setup ---
-# These are initialized once when hdmap.py is imported by the main loop.
-ZMQ_PORT = "5555"
-ZMQ_ADDR = f"tcp://*:{ZMQ_PORT}"
-TOPIC = b"HDMAP"
-
-# Initialize ZMQ Context and Socket globally
-context = zmq.Context()
-socket = context.socket(zmq.PUB)
+# import zmq
+# import matplotlib
+# matplotlib.use('Agg')  # use non-interactive backend
+# import matplotlib.pyplot as plt
+# from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+# from io import BytesIO
 
 import team_code_autopilot.utils.test_xodr as tx
 import team_code_autopilot.utils.carla_vehicle_annotator as cva
@@ -89,19 +80,9 @@ class HDMap:
         # self.use_masked_points = False  # whether to filter hdmap points by frustum masks
 
 
-        # Static Matplotlib figure for Agg backend          
-        self.fig, self.ax = plt.subplots(figsize=(8, 8))
-        self.canvas = FigureCanvas(self.fig)
-
         if self.is_visualize:
-            # Bind the globally defined ZMQ socket here.
-            # This happens when the HDMap object is created in the main loop.
-            try:
-                # Use a specific address if running in a container/cluster
-                socket.bind(ZMQ_ADDR.replace("*", "0.0.0.0")) 
-                print(f"[HDMap] ZMQ Publisher bound to {ZMQ_ADDR}")
-            except zmq.error.ZMQError as e:
-                print(f"[HDMap] ZMQ bind failed. Check if port {ZMQ_PORT} is free: {e}")
+            cv2.namedWindow("HDMap_Debug", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("HDMap_Debug", 800, 800)
 
         # Ego and camera
         # self.is_ego_ready = False
@@ -208,11 +189,6 @@ class HDMap:
         try:
             if getattr(self, "is_visualize", False):
                 cv2.destroyWindow("HDMap_Debug")
-        except Exception:
-            pass
-
-        try:
-            plt.close(self.fig)
         except Exception:
             pass
 
@@ -754,6 +730,7 @@ class HDMap:
         self.cross_mask_clustered   = self._group_points_by_id(self.cross_pts,   cross_idx,   self.cross_mask)
 
 
+
         # update ego information
         ego_tf = ego_snap.get_transform()
         ego_loc = ego_tf.location
@@ -964,565 +941,341 @@ class HDMap:
 
 
     def _make_hdmap_image_ego(
-            self,
-            center_pts: np.ndarray,
-            divider_pts: np.ndarray,
-            bound_pts: np.ndarray,
-            cross_pts: np.ndarray,
-            ego_snap,
-            img_size=(800, 800), # Not used directly in Matplotlib plotting commands, only for dpi/output
-            pixels_per_meter: float = 4.0, # Not used directly in Matplotlib plotting commands, only for setting limits/scale
-            curr_wp_world: Optional[np.ndarray] = None,
-            next_wp_world: Optional[np.ndarray] = None,
-            path_pts: Optional[np.ndarray] = None,
-            vehicle_bboxes_3d: Optional[list] = None,
-            pedestrian_bboxes_3d: Optional[list] = None,
-            current_lane_pts: Optional[np.ndarray] = None,
-            left_lane_pts: Optional[np.ndarray] = None,
-            right_lane_pts: Optional[np.ndarray] = None,
-            debug_next_wp: Optional[np.ndarray] = None,
-            debug_left_wp: Optional[np.ndarray] = None,
-            debug_right_wp: Optional[np.ndarray] = None,
-        ) -> bytes:
+        self,
+        center_pts: np.ndarray,
+        divider_pts: np.ndarray,
+        bound_pts: np.ndarray,
+        cross_pts: np.ndarray,
+        ego_snap,
+        img_size=(800, 800),
+        pixels_per_meter: float = 4.0,
+        curr_wp_world: Optional[np.ndarray] = None, # adding waypoint features
+        next_wp_world: Optional[np.ndarray] = None, # adding waypoint features
+        path_pts: Optional[np.ndarray] = None,
+        vehicle_bboxes_3d: Optional[list] = None,
+        pedestrian_bboxes_3d: Optional[list] = None,
+        current_lane_pts: Optional[np.ndarray] = None,
+        left_lane_pts: Optional[np.ndarray] = None,
+        right_lane_pts: Optional[np.ndarray] = None,
+        debug_next_wp: Optional[np.ndarray] = None,  # adding debug next waypoint feature
+        debug_left_wp: Optional[np.ndarray] = None,  # adding debug left waypoint feature
+        debug_right_wp: Optional[np.ndarray] = None,  # adding debug right waypoint feature
+    ) -> np.ndarray:
+        """
+        Create an ego-centered HD map image, similar to simple_hdmap_image()
+        in hdmap_vis.py.
+
+        - center_pts, divider_pts, bound_pts, cross_pts: (N,3) arrays in world frame.
+        - ego_snap: cva.snap_processing(...) result for ego
+        - img_size: output image size (h, w)
+        - pixels_per_meter: scaling of meters -> pixels
+        """
+        h, w = img_size
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+
+        # Ego pose from snap
+        ego_tf = ego_snap.get_transform()
+        ego_loc = ego_tf.location
+        ego_rot = ego_tf.rotation
+
+        ego_x = ego_loc.x
+        ego_y = ego_loc.y
+        ego_yaw = math.radians(ego_rot.yaw)
+
+        cos_yaw = math.cos(ego_yaw)
+        sin_yaw = math.sin(ego_yaw)
+
+        # Image center == ego position
+        cx = w // 2
+        cy = h // 2
+
+        def world_to_ego_pixel(x, y):
+            # 1) world -> ego frame (Y_body forward, X_body left)
+            dx = x - ego_x
+            dy = y - ego_y
+
+            Y_body =  cos_yaw * dx + sin_yaw * dy   # forward(+)
+            X_body = -sin_yaw * dx + cos_yaw * dy   # left(+)
+
+            # 2) ego -> pixel
+            ix = int(round(cx + X_body * pixels_per_meter))
+            iy = int(round(cy - Y_body * pixels_per_meter))  # forward => up
+            return ix, iy
+
+        def draw_points(pts, color, radius=1):
             """
-            Create an ego-centered HD map image using only Matplotlib, 
-            render to JPEG bytes, and return the bytes for ZMQ transmission.
+            Draw points for:
+              - a single (N, 3) numpy array, or
+              - a list / tuple of such arrays (polylines).
             """
-            # Ensure Matplotlib objects are available
-            if self.fig is None or self.ax is None:
-                return b'' # Cannot render
+            if pts is None:
+                return
 
-            ax = self.ax
-            ax.clear()
-            
-            # Ego pose from snap
-            ego_tf = ego_snap.get_transform()
-            ego_loc = ego_tf.location
-            ego_rot = ego_tf.rotation
+            # If we got polyline groups, recurse on each
+            if isinstance(pts, (list, tuple)):
+                for seg in pts:
+                    draw_points(seg, color, radius)
+                return
 
-            ego_x = ego_loc.x
-            ego_y = ego_loc.y
-            ego_yaw = math.radians(ego_rot.yaw)
+            pts = np.asarray(pts)
+            if pts.size == 0:
+                return
 
-            cos_yaw = math.cos(ego_yaw)
-            sin_yaw = math.sin(ego_yaw)
-            
-            # Decide view window (Meters)
-            half_range_m = 50.0  # Setting a fixed visible range of 30m x 30m
+            xs = pts[:, 0]
+            ys = pts[:, 1]
+            for x, y in zip(xs, ys):
+                ix, iy = world_to_ego_pixel(x, y)
+                if 0 <= ix < w and 0 <= iy < h:
+                    cv2.circle(img, (ix, iy), radius, color, -1)
 
-            def world_to_ego_xy(x, y):
-                """Convert world (x, y) to ego body frame (X_body, Y_body)."""
-                dx = x - ego_x
-                dy = y - ego_y
-                Yb = cos_yaw * dx + sin_yaw * dy
-                Xb = -sin_yaw * dx + cos_yaw * dy
-                return Xb, Yb
 
-            def draw_points(pts, color, size=4):
-                """Draw points using ax.scatter."""
-                if pts is None: return
+        def draw_polyline(pts, color, thickness=2):
+            if pts is None:
+                return
+            pts = np.asarray(pts)
+            if len(pts) < 2:
+                return
+            xs = pts[:, 0]
+            ys = pts[:, 1]
+            prev_px = None
+            for x, y in zip(xs, ys):
+                ix, iy = world_to_ego_pixel(x, y)
+                if 0 <= ix < w and 0 <= iy < h:
+                    if prev_px is not None:
+                        cv2.line(img, prev_px, (ix, iy), color, thickness)
+                    prev_px = (ix, iy)
+                else:
+                    prev_px = None
 
-                if isinstance(pts, (list, tuple)):
-                    for seg in pts:
-                        draw_points(seg, color, size)
-                    return
+        def draw_bbox_centers(bboxes, color, half_size_px=4):
+            """
+            Draw simple square bboxes using the center of each 3D bbox.
 
-                pts_np = np.asarray(pts)
-                if pts_np.size == 0: return
+            Supports:
+              - dict entries from ga.get_vehicle_bbox (with 'corners_world' / 'gt_array')
+              - arrays/lists of corners: (N, 3)
+              - single 3D point: (3,)
+            """
+            if bboxes is None:
+                return
 
-                xs_body, ys_body = [], []
-                for x, y in zip(pts_np[:, 0], pts_np[:, 1]):
-                    Xb, Yb = world_to_ego_xy(x, y)
-                    xs_body.append(Xb)
-                    ys_body.append(Yb)
+            for bb in bboxes:
+                if bb is None:
+                    continue
 
-                # Use ax.scatter for points (size=pixels)
-                ax.scatter(xs_body, ys_body, s=size, c=color, marker='.', linewidths=0)
+                center_world = None
 
-            def draw_polyline(pts, color, linewidth=2.0):
-                """Draw polyline using ax.plot."""
-                if pts is None: return
-                pts_np = np.asarray(pts)
-                if len(pts_np) < 2: return
+                # ----- Case 1: dict from ga.get_vehicle_bbox -----
+                if isinstance(bb, dict):
+                    # Prefer corners_world if available
+                    if "corners_world" in bb and bb["corners_world"]:
+                        corners = np.asarray(bb["corners_world"], dtype=float)
+                        if corners.ndim == 2 and corners.shape[1] >= 2:
+                            center_world = corners.mean(axis=0)  # (3,)
+                    # Fallback: gt_array (first 3 = x,y,z)
+                    if center_world is None and "gt_array" in bb:
+                        arr = np.asarray(bb["gt_array"], dtype=float)
+                        if arr.size >= 3:
+                            center_world = arr[:3]
 
-                xs_body, ys_body = [], []
-                for x, y in zip(pts_np[:, 0], pts_np[:, 1]):
-                    Xb, Yb = world_to_ego_xy(x, y)
-                    xs_body.append(Xb)
-                    ys_body.append(Yb)
+                # ----- Case 2: not a dict -> interpret as array-like -----
+                else:
+                    bb_arr = np.asarray(bb, dtype=float)
 
-                # Use ax.plot for lines
-                ax.plot(xs_body, ys_body, color=color, linewidth=linewidth)
-
-            def draw_bbox_centers(bboxes, color, size=30, label_prefix=None):
-                """
-                Draw bbox centers as square markers in ego frame.
-                The size parameter here corresponds to the square marker area (s=area).
-                """
-                if bboxes is None: return
-
-                xs_body, ys_body = [], []
-                
-                for bb in bboxes:
-                    # Logic to find center_world (retained from original)
-                    center_world = None
-                    if isinstance(bb, dict):
-                        if "corners_world" in bb and bb["corners_world"]:
-                            corners = np.asarray(bb["corners_world"], dtype=float)
-                            if corners.ndim == 2 and corners.shape[1] >= 2:
-                                center_world = corners.mean(axis=0)
-                        if center_world is None and "gt_array" in bb:
-                            arr = np.asarray(bb["gt_array"], dtype=float)
-                            if arr.size >= 3:
-                                center_world = arr[:3]
-                    else:
-                        bb_arr = np.asarray(bb, dtype=float)
-                        if bb_arr.ndim == 1 and bb_arr.shape[0] >= 2:
-                            center_world = bb_arr
-                        elif bb_arr.ndim == 2 and bb_arr.shape[1] >= 2:
-                            center_world = bb_arr.mean(axis=0)
-
-                    if center_world is None or len(center_world) < 2:
+                    if bb_arr.size == 0:
                         continue
 
-                    Xb, Yb = world_to_ego_xy(center_world[0], center_world[1])
-                    xs_body.append(Xb)
-                    ys_body.append(Yb)
-                    
-                    if label_prefix:
-                        ax.text(Xb + 0.3, Yb + 0.3, label_prefix, color=color, fontsize=8)
+                    if bb_arr.ndim == 0:
+                        # scalar, no spatial info
+                        continue
+                    elif bb_arr.ndim == 1:
+                        # single 3D point
+                        if bb_arr.shape[0] >= 2:
+                            center_world = bb_arr
+                    else:
+                        # corners (N, 3)
+                        if bb_arr.shape[1] >= 2:
+                            center_world = bb_arr.mean(axis=0)
 
-                if xs_body:
-                    # Use 's' for square marker
-                    ax.scatter(xs_body, ys_body, s=size, c=color, marker='s', linewidths=0)
+                # If we still couldn't get a center, skip this bbox
+                if center_world is None:
+                    continue
 
+                # Need at least x, y
+                if len(center_world) < 2:
+                    continue
 
-            # -------------------------------------------------------------------
-            ## 1. DRAW HDMAP LAYERS (centerlines, boundaries)
-            # -------------------------------------------------------------------
-            
-            # Colors (Matplotlib colors/names)
-            color_center  = 'cyan'
-            color_divider = 'lime'
-            color_bound   = 'yellow'
-            color_cross   = 'magenta'
+                ix, iy = world_to_ego_pixel(center_world[0], center_world[1])
 
-            draw_points(center_pts,  color_center,  size=7)
-            draw_points(divider_pts, color_divider, size=7)
-            draw_points(bound_pts,   color_bound,   size=7)
-            draw_points(cross_pts,   color_cross,   size=7)
+                if 0 <= ix < w and 0 <= iy < h:
+                    x1 = int(ix - half_size_px)
+                    y1 = int(iy - half_size_px)
+                    x2 = int(ix + half_size_px)
+                    y2 = int(iy + half_size_px)
+                    cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
+        # Colors
+        color_center  = (0, 255, 255)  # centerline
+        color_divider = (0, 255, 0)    # lane divider
+        color_bound   = (255, 255, 0)  # road boundary
+        color_cross   = (255, 0, 255)  # crosswalk
 
-            # -------------------------------------------------------------------
-            ## 2. DRAW ACTORS (Vehicles & Pedestrians)
-            # -------------------------------------------------------------------
-            draw_bbox_centers(vehicle_bboxes_3d,    color='blue',    size=40, label_prefix=None)
-            draw_bbox_centers(pedestrian_bboxes_3d, color='magenta', size=35, label_prefix=None)
+        # Draw layers
+        draw_points(center_pts,  color_center,  radius=1)
+        # draw_points(divider_pts, color_divider, radius=1)
+        draw_points(bound_pts,   color_bound,   radius=1)
+        # draw_points(cross_pts,   color_cross,   radius=1)
 
-            # -------------------------------------------------------------------
-            ## 3. DRAW EGO & WAYPOINTS
-            # -------------------------------------------------------------------
+        # Vehicles: blue squares
+        draw_bbox_centers(vehicle_bboxes_3d, color=(255, 0, 0), half_size_px=5)
+        # Pedestrians: magenta squares
+        draw_bbox_centers(pedestrian_bboxes_3d, color=(255, 0, 255), half_size_px=4)
 
-            # Ego at (0, 0)
-            ax.scatter([0.0], [0.0], c='red', s=50, marker='o')
-            ax.text(0.2, 0.2, "EGO", color='red', fontsize=8)
+        # Ego marker at center
+        cv2.circle(img, (cx, cy), 3, (0, 0, 255), -1)
+        cv2.putText(img, "EGO", (cx + 5, cy - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
 
-            def draw_wp(p, label, color, size=50):
-                if p is None: return
-                p = np.asarray(p, dtype=float).reshape(-1)
-                Xb, Yb = world_to_ego_xy(p[0], p[1])
-                ax.scatter([Xb], [Yb], c=color, s=size, marker='o')
-                ax.text(Xb + 0.3, Yb + 0.3, label, color=color, fontsize=8)
+        # ----- Optional: draw current & next global waypoints -----
+        # curr_wp_world in RED
+        if curr_wp_world is not None:
+            curr_wp_world = np.asarray(curr_wp_world, dtype=float).reshape(-1)
+            ix, iy = world_to_ego_pixel(curr_wp_world[0], curr_wp_world[1])
+            if 0 <= ix < w and 0 <= iy < h:
+                cv2.circle(img, (ix, iy), 6, (0, 0, 255), -1)
+                cv2.putText(img, "C", (ix + 4, iy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-            # Global Waypoints (C: Current, N: Next)
-            draw_wp(curr_wp_world, "C", 'red', size=60)
-            draw_wp(next_wp_world, "N", 'green', size=60)
+        # next_wp_world in GREEN
+        if next_wp_world is not None:
+            next_wp_world = np.asarray(next_wp_world, dtype=float).reshape(-1)
+            ix, iy = world_to_ego_pixel(next_wp_world[0], next_wp_world[1])
+            if 0 <= ix < w and 0 <= iy < h:
+                cv2.circle(img, (ix, iy), 6, (0, 255, 0), -1)
+                cv2.putText(img, "N", (ix + 4, iy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-            # Debug Waypoints (W: Local Next, Wl: Left, Wr: Right)
-            draw_wp(debug_next_wp,  "W",  'cyan', size=40)
-            draw_wp(debug_left_wp,  "Wl", 'green', size=40)
-            draw_wp(debug_right_wp, "Wr", 'magenta', size=40)
+        # ----- Draw lane centerlines (current / left / right) -----
+        # Use thin lines so they don't dominate the HD map
+        if current_lane_pts is not None and len(current_lane_pts) > 1:
+            # white for current lane
+            draw_polyline(current_lane_pts, color=(255, 255, 255), thickness=3)
 
-            # -------------------------------------------------------------------
-            ## 4. DRAW LANE PATHS / ROUTE
-            # -------------------------------------------------------------------
-            
-            # Current Lane Path (White, thicker)
-            if current_lane_pts is not None:
-                draw_polyline(current_lane_pts, color='white', linewidth=2.5)
-                
-            # Neighbor Lanes
-            draw_polyline(left_lane_pts,  color='yellow', linewidth=2.0)
-            draw_polyline(right_lane_pts, color='orange', linewidth=2.0)
+        if left_lane_pts is not None and len(left_lane_pts) > 1:
+            # cyan-ish for left lane
+            draw_polyline(left_lane_pts, color=(255, 255, 0), thickness=3)
 
-            # Route Path (colored by obstacle status)
-            if path_pts is not None:
-                route_blocked = self._obstacle_in_front
-                route_color = 'red' if route_blocked else 'blue'
-                draw_polyline(path_pts, color=route_color, linewidth=2.0)
-
-            # -------------------------------------------------------------------
-            ## 5. AXES FORMATTING & RENDERING
-            # -------------------------------------------------------------------
-            ax.set_xlim(-half_range_m, half_range_m)
-            ax.set_ylim(-half_range_m, half_range_m)
-            ax.set_aspect('equal', 'box')
-            ax.set_xlabel("X_body (left +m)")
-            ax.set_ylabel("Y_body (forward +m)")
-            ax.grid(True, alpha=0.3)
-
-            # --- Render to JPEG Buffer ---
-            buf = BytesIO()
-            # Use fig.savefig for the 'Agg' backend to safely render to memory
-            self.fig.savefig(buf, format='jpeg', dpi=100) # dpi controls final image resolution
-            buf.seek(0)
-            jpeg_bytes = buf.read()
-            
-            # Crucial step: clear the figure for the next tick
-            self.fig.clear() 
-            self.ax = self.fig.add_subplot(111)
-            
-            return jpeg_bytes
-
-    # def _make_hdmap_image_ego(
-    #     self,
-    #     center_pts: np.ndarray,
-    #     divider_pts: np.ndarray,
-    #     bound_pts: np.ndarray,
-    #     cross_pts: np.ndarray,
-    #     ego_snap,
-    #     img_size=(800, 800),
-    #     pixels_per_meter: float = 4.0,
-    #     curr_wp_world: Optional[np.ndarray] = None, # adding waypoint features
-    #     next_wp_world: Optional[np.ndarray] = None, # adding waypoint features
-    #     path_pts: Optional[np.ndarray] = None,
-    #     vehicle_bboxes_3d: Optional[list] = None,
-    #     pedestrian_bboxes_3d: Optional[list] = None,
-    #     current_lane_pts: Optional[np.ndarray] = None,
-    #     left_lane_pts: Optional[np.ndarray] = None,
-    #     right_lane_pts: Optional[np.ndarray] = None,
-    #     debug_next_wp: Optional[np.ndarray] = None,  # adding debug next waypoint feature
-    #     debug_left_wp: Optional[np.ndarray] = None,  # adding debug left waypoint feature
-    #     debug_right_wp: Optional[np.ndarray] = None,  # adding debug right waypoint feature
-    # ) -> bytes:
-    #     """
-    #     Create an ego-centered HD map image, similar to simple_hdmap_image()
-    #     in hdmap_vis.py.
-
-    #     - center_pts, divider_pts, bound_pts, cross_pts: (N,3) arrays in world frame.
-    #     - ego_snap: cva.snap_processing(...) result for ego
-    #     - img_size: output image size (h, w)
-    #     - pixels_per_meter: scaling of meters -> pixels
-    #     """
-    #     h, w = img_size
-    #     img = np.zeros((h, w, 3), dtype=np.uint8)
-
-    #     # Ego pose from snap
-    #     ego_tf = ego_snap.get_transform()
-    #     ego_loc = ego_tf.location
-    #     ego_rot = ego_tf.rotation
-
-    #     ego_x = ego_loc.x
-    #     ego_y = ego_loc.y
-    #     ego_yaw = math.radians(ego_rot.yaw)
-
-    #     cos_yaw = math.cos(ego_yaw)
-    #     sin_yaw = math.sin(ego_yaw)
-
-    #     # Image center == ego position
-    #     cx = w // 2
-    #     cy = h // 2
-
-    #     def world_to_ego_pixel(x, y):
-    #         # 1) world -> ego frame (Y_body forward, X_body left)
-    #         dx = x - ego_x
-    #         dy = y - ego_y
-
-    #         Y_body =  cos_yaw * dx + sin_yaw * dy   # forward(+)
-    #         X_body = -sin_yaw * dx + cos_yaw * dy   # left(+)
-
-    #         # 2) ego -> pixel
-    #         ix = int(round(cx + X_body * pixels_per_meter))
-    #         iy = int(round(cy - Y_body * pixels_per_meter))  # forward => up
-    #         return ix, iy
-
-    #     def draw_points(pts, color, radius=1):
-    #         """
-    #         Draw points for:
-    #           - a single (N, 3) numpy array, or
-    #           - a list / tuple of such arrays (polylines).
-    #         """
-    #         if pts is None:
-    #             return
-
-    #         # If we got polyline groups, recurse on each
-    #         if isinstance(pts, (list, tuple)):
-    #             for seg in pts:
-    #                 draw_points(seg, color, radius)
-    #             return
-
-    #         pts = np.asarray(pts)
-    #         if pts.size == 0:
-    #             return
-
-    #         xs = pts[:, 0]
-    #         ys = pts[:, 1]
-    #         for x, y in zip(xs, ys):
-    #             ix, iy = world_to_ego_pixel(x, y)
-    #             if 0 <= ix < w and 0 <= iy < h:
-    #                 cv2.circle(img, (ix, iy), radius, color, -1)
+        if right_lane_pts is not None and len(right_lane_pts) > 1:
+            # yellow-ish for right lane
+            draw_polyline(right_lane_pts, color=(0, 255, 255), thickness=3)
 
 
-    #     def draw_polyline(pts, color, thickness=2):
-    #         if pts is None:
-    #             return
-    #         pts = np.asarray(pts)
-    #         if len(pts) < 2:
-    #             return
-    #         xs = pts[:, 0]
-    #         ys = pts[:, 1]
-    #         prev_px = None
-    #         for x, y in zip(xs, ys):
-    #             ix, iy = world_to_ego_pixel(x, y)
-    #             if 0 <= ix < w and 0 <= iy < h:
-    #                 if prev_px is not None:
-    #                     cv2.line(img, prev_px, (ix, iy), color, thickness)
-    #                 prev_px = (ix, iy)
-    #             else:
-    #                 prev_px = None
+        if path_pts is not None and len(path_pts) > 1:
+            # Check if route overlaps any vehicle bbox (ground footprint)
+            route_blocked = self._obstacle_in_front
+            # if vehicle_bboxes_3d:
+            #     for bb in vehicle_bboxes_3d:
+            #         if bb is None:
+            #             continue
+                    # if self._route_overlaps_bbox(path_pts, bb, margin=0.5):
+                    #     route_blocked = True
+                    #     break
+                    # if self.is_obstacle_in_front(
+                    #     distance=10.0,
+                    #     margin=0.5):
+                    #     route_blocked = True
 
-    #     def draw_bbox_centers(bboxes, color, half_size_px=4):
-    #         """
-    #         Draw simple square bboxes using the center of each 3D bbox.
+                    #     break
 
-    #         Supports:
-    #           - dict entries from ga.get_vehicle_bbox (with 'corners_world' / 'gt_array')
-    #           - arrays/lists of corners: (N, 3)
-    #           - single 3D point: (3,)
-    #         """
-    #         if bboxes is None:
-    #             return
+            # If not overlapped → BLUE (as before), if overlapped → RED
+            color_free = (255, 0, 0)   # blue in BGR
+            color_blocked = (0, 0, 255)  # red in BGR
+            route_color = color_blocked if route_blocked else color_free
 
-    #         for bb in bboxes:
-    #             if bb is None:
-    #                 continue
-
-    #             center_world = None
-
-    #             # ----- Case 1: dict from ga.get_vehicle_bbox -----
-    #             if isinstance(bb, dict):
-    #                 # Prefer corners_world if available
-    #                 if "corners_world" in bb and bb["corners_world"]:
-    #                     corners = np.asarray(bb["corners_world"], dtype=float)
-    #                     if corners.ndim == 2 and corners.shape[1] >= 2:
-    #                         center_world = corners.mean(axis=0)  # (3,)
-    #                 # Fallback: gt_array (first 3 = x,y,z)
-    #                 if center_world is None and "gt_array" in bb:
-    #                     arr = np.asarray(bb["gt_array"], dtype=float)
-    #                     if arr.size >= 3:
-    #                         center_world = arr[:3]
-
-    #             # ----- Case 2: not a dict -> interpret as array-like -----
-    #             else:
-    #                 bb_arr = np.asarray(bb, dtype=float)
-
-    #                 if bb_arr.size == 0:
-    #                     continue
-
-    #                 if bb_arr.ndim == 0:
-    #                     # scalar, no spatial info
-    #                     continue
-    #                 elif bb_arr.ndim == 1:
-    #                     # single 3D point
-    #                     if bb_arr.shape[0] >= 2:
-    #                         center_world = bb_arr
-    #                 else:
-    #                     # corners (N, 3)
-    #                     if bb_arr.shape[1] >= 2:
-    #                         center_world = bb_arr.mean(axis=0)
-
-    #             # If we still couldn't get a center, skip this bbox
-    #             if center_world is None:
-    #                 continue
-
-    #             # Need at least x, y
-    #             if len(center_world) < 2:
-    #                 continue
-
-    #             ix, iy = world_to_ego_pixel(center_world[0], center_world[1])
-
-    #             if 0 <= ix < w and 0 <= iy < h:
-    #                 x1 = int(ix - half_size_px)
-    #                 y1 = int(iy - half_size_px)
-    #                 x2 = int(ix + half_size_px)
-    #                 y2 = int(iy + half_size_px)
-    #                 cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
-    #     # Colors
-    #     color_center  = (0, 255, 255)  # centerline
-    #     color_divider = (0, 255, 0)    # lane divider
-    #     color_bound   = (255, 255, 0)  # road boundary
-    #     color_cross   = (255, 0, 255)  # crosswalk
-
-    #     # Draw layers
-    #     draw_points(center_pts,  color_center,  radius=1)
-    #     # draw_points(divider_pts, color_divider, radius=1)
-    #     draw_points(bound_pts,   color_bound,   radius=1)
-    #     # draw_points(cross_pts,   color_cross,   radius=1)
-
-    #     # Vehicles: blue squares
-    #     draw_bbox_centers(vehicle_bboxes_3d, color=(255, 0, 0), half_size_px=5)
-    #     # Pedestrians: magenta squares
-    #     draw_bbox_centers(pedestrian_bboxes_3d, color=(255, 0, 255), half_size_px=4)
-
-    #     # Ego marker at center
-    #     cv2.circle(img, (cx, cy), 3, (0, 0, 255), -1)
-    #     cv2.putText(img, "EGO", (cx + 5, cy - 5),
-    #                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-
-    #     # ----- Optional: draw current & next global waypoints -----
-    #     # curr_wp_world in RED
-    #     if curr_wp_world is not None:
-    #         curr_wp_world = np.asarray(curr_wp_world, dtype=float).reshape(-1)
-    #         ix, iy = world_to_ego_pixel(curr_wp_world[0], curr_wp_world[1])
-    #         if 0 <= ix < w and 0 <= iy < h:
-    #             cv2.circle(img, (ix, iy), 6, (0, 0, 255), -1)
-    #             cv2.putText(img, "C", (ix + 4, iy - 4),
-    #                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-
-    #     # next_wp_world in GREEN
-    #     if next_wp_world is not None:
-    #         next_wp_world = np.asarray(next_wp_world, dtype=float).reshape(-1)
-    #         ix, iy = world_to_ego_pixel(next_wp_world[0], next_wp_world[1])
-    #         if 0 <= ix < w and 0 <= iy < h:
-    #             cv2.circle(img, (ix, iy), 6, (0, 255, 0), -1)
-    #             cv2.putText(img, "N", (ix + 4, iy - 4),
-    #                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-    #     # ----- Draw lane centerlines (current / left / right) -----
-    #     # Use thin lines so they don't dominate the HD map
-    #     if current_lane_pts is not None and len(current_lane_pts) > 1:
-    #         # white for current lane
-    #         draw_polyline(current_lane_pts, color=(255, 255, 255), thickness=3)
-
-    #     if left_lane_pts is not None and len(left_lane_pts) > 1:
-    #         # cyan-ish for left lane
-    #         draw_polyline(left_lane_pts, color=(255, 255, 0), thickness=3)
-
-    #     if right_lane_pts is not None and len(right_lane_pts) > 1:
-    #         # yellow-ish for right lane
-    #         draw_polyline(right_lane_pts, color=(0, 255, 255), thickness=3)
+            # path_pts is expected to be (M, 3) in world coords (self._current_lane_path)
+            draw_polyline(path_pts, color=route_color, thickness=2)
+        else:
+            print("No path_pts to draw in HD map image.")
 
 
-    #     if path_pts is not None and len(path_pts) > 1:
-    #         # Check if route overlaps any vehicle bbox (ground footprint)
-    #         route_blocked = self._obstacle_in_front
-    #         # if vehicle_bboxes_3d:
-    #         #     for bb in vehicle_bboxes_3d:
-    #         #         if bb is None:
-    #         #             continue
-    #                 # if self._route_overlaps_bbox(path_pts, bb, margin=0.5):
-    #                 #     route_blocked = True
-    #                 #     break
-    #                 # if self.is_obstacle_in_front(
-    #                 #     distance=10.0,
-    #                 #     margin=0.5):
-    #                 #     route_blocked = True
+        # ----- Draw debug local next waypoint (from get_next_waypoint) -----
+        if debug_next_wp is not None:
+            debug_next_wp = np.asarray(debug_next_wp, dtype=float).reshape(-1)
+            ix, iy = world_to_ego_pixel(debug_next_wp[0], debug_next_wp[1])
+            if 0 <= ix < w and 0 <= iy < h:
+                # Cyan circle with label "W"
+                cv2.circle(img, (ix, iy), 5, (255, 255, 0), -1)
+                cv2.putText(img, "W", (ix + 4, iy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
-    #                 #     break
+        # Left lane waypoint: green circle "Wl"
+        if debug_left_wp is not None:
+            p = np.asarray(debug_left_wp, dtype=float).reshape(-1)
+            ix, iy = world_to_ego_pixel(p[0], p[1])
+            if 0 <= ix < w and 0 <= iy < h:
+                cv2.circle(img, (ix, iy), 5, (0, 255, 0), -1)  # green
+                cv2.putText(img, "Wl", (ix + 4, iy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-    #         # If not overlapped → BLUE (as before), if overlapped → RED
-    #         color_free = (255, 0, 0)   # blue in BGR
-    #         color_blocked = (0, 0, 255)  # red in BGR
-    #         route_color = color_blocked if route_blocked else color_free
+        # Right lane waypoint: magenta circle "Wr"
+        if debug_right_wp is not None:
+            p = np.asarray(debug_right_wp, dtype=float).reshape(-1)
+            ix, iy = world_to_ego_pixel(p[0], p[1])
+            if 0 <= ix < w and 0 <= iy < h:
+                cv2.circle(img, (ix, iy), 5, (255, 0, 255), -1)  # magenta
+                cv2.putText(img, "Wr", (ix + 4, iy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
 
-    #         # path_pts is expected to be (M, 3) in world coords (self._current_lane_path)
-    #         draw_polyline(path_pts, color=route_color, thickness=2)
-    #     else:
-    #         print("No path_pts to draw in HD map image.")
+        return img
 
-
-    #     # ----- Draw debug local next waypoint (from get_next_waypoint) -----
-    #     if debug_next_wp is not None:
-    #         debug_next_wp = np.asarray(debug_next_wp, dtype=float).reshape(-1)
-    #         ix, iy = world_to_ego_pixel(debug_next_wp[0], debug_next_wp[1])
-    #         if 0 <= ix < w and 0 <= iy < h:
-    #             # Cyan circle with label "W"
-    #             cv2.circle(img, (ix, iy), 5, (255, 255, 0), -1)
-    #             cv2.putText(img, "W", (ix + 4, iy - 4),
-    #                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-    #     # Left lane waypoint: green circle "Wl"
-    #     if debug_left_wp is not None:
-    #         p = np.asarray(debug_left_wp, dtype=float).reshape(-1)
-    #         ix, iy = world_to_ego_pixel(p[0], p[1])
-    #         if 0 <= ix < w and 0 <= iy < h:
-    #             cv2.circle(img, (ix, iy), 5, (0, 255, 0), -1)  # green
-    #             cv2.putText(img, "Wl", (ix + 4, iy - 4),
-    #                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-    #     # Right lane waypoint: magenta circle "Wr"
-    #     if debug_right_wp is not None:
-    #         p = np.asarray(debug_right_wp, dtype=float).reshape(-1)
-    #         ix, iy = world_to_ego_pixel(p[0], p[1])
-    #         if 0 <= ix < w and 0 <= iy < h:
-    #             cv2.circle(img, (ix, iy), 5, (255, 0, 255), -1)  # magenta
-    #             cv2.putText(img, "Wr", (ix + 4, iy - 4),
-    #                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
-
-    #     return img
 
     def _draw_hdmap_debug(self):
-            """
-            Renders the HDMap to a JPEG buffer and sends it via ZMQ.
-            
-            Assumes 'socket' (zmq.PUB) and 'TOPIC' (bytes) are defined globally 
-            in the imported hdmap.py module.
-            """
-            if not self.is_visualize:
-                return
-            if self._ego_snap is None:
-                return
+        """
+        Visualize current HD-map in an ego-centered frame:
 
-            path_pts = self._current_lane_path # if self._current_path_valid else None
-            
-            current_lane_pts = self._current_lane_path if self._current_path_valid else None
-            left_lane_pts = self._left_lane_path if self._left_path_valid else None
-            right_lane_pts = self._right_lane_path if self._right_path_valid else None
+          - visible center/divider/bound/cross (using masks)
+          - ego vehicle at image center
 
-            # 1. Delegate image creation to helper, which now returns JPEG bytes
-            jpeg_data = self._make_hdmap_image_ego(
-                center_pts=self._center_map_clustered,
-                divider_pts=self.divider_mask_clustered,
-                bound_pts=self.bound_mask_clustered,
-                cross_pts=self.cross_mask_clustered,
-                ego_snap=self._ego_snap,
-                img_size=(800, 800),
-                pixels_per_meter=4.0,
-                curr_wp_world=self._curr_wp_world,
-                next_wp_world=self._next_wp_world,
-                path_pts=path_pts,
-                vehicle_bboxes_3d=self._vehicle_bboxes_3d,
-                pedestrian_bboxes_3d=self._pedestrian_bboxes_3d,
-                current_lane_pts=current_lane_pts,
-                left_lane_pts=left_lane_pts,
-                right_lane_pts=right_lane_pts,
-                debug_next_wp=self._debug_next_wp,
-                debug_left_wp=self._debug_left_wp,
-                debug_right_wp=self._debug_right_wp,
-            )
+        For now: no A* route, no global waypoint visualization.
+        """
+        if not self.is_visualize:
+            return
+        if self._ego_snap is None:
+            return
 
-            # 2. Send the image data via ZMQ
-            if jpeg_data:
-                try:
-                    # ZMQ PUBLISH: Send the topic followed by the data
-                    # e.g., b"HDMAP " + b"[...jpeg bytes...]"
-                    socket.send(TOPIC + b" " + jpeg_data)
-                except zmq.error.ZMQError as e:
-                    # Handle cases where the socket might close or disconnect
-                    print(f"[HDMap] ZMQ Send Error (Ignored): {e}")
 
-            # Remove the previous cv2.imshow/waitKey calls
-            # cv2.imshow("HDMap_Debug", img)
-            # cv2.waitKey(1)
+        path_pts = self._current_lane_path # if self._current_path_valid else None
+        
+
+        current_lane_pts = self._current_lane_path if self._current_path_valid else None
+        left_lane_pts = self._left_lane_path if self._left_path_valid else None
+        right_lane_pts = self._right_lane_path if self._right_path_valid else None
+
+    
+        # Delegate image creation to modular helper (same as hdmap_vis.py)
+        img = self._make_hdmap_image_ego(
+            center_pts=self._center_map_clustered, #self.center_mask_clustered,
+            divider_pts=self.divider_mask_clustered,
+            bound_pts=self.bound_mask_clustered,
+            cross_pts=self.cross_mask_clustered,
+            ego_snap=self._ego_snap,
+            img_size=(800, 800),
+            pixels_per_meter=4.0,
+            curr_wp_world=self._curr_wp_world,
+            next_wp_world=self._next_wp_world,
+            path_pts=path_pts,
+            vehicle_bboxes_3d=self._vehicle_bboxes_3d,
+            pedestrian_bboxes_3d=self._pedestrian_bboxes_3d,
+            current_lane_pts=current_lane_pts,
+            left_lane_pts=left_lane_pts,
+            right_lane_pts=right_lane_pts,
+            debug_next_wp=self._debug_next_wp,
+            debug_left_wp=self._debug_left_wp,
+            debug_right_wp=self._debug_right_wp,
+        )
+
+        cv2.imshow("HDMap_Debug", img)
+        cv2.waitKey(1)
+
 
     def _route_overlaps_bbox(self, route_pts, bbox: dict, margin: float = 0.0) -> bool:
         """
