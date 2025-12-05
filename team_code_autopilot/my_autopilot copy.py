@@ -13,13 +13,65 @@ from my_auto_config import MyAutoConfig
 
 from utils.hdmap import HDMap
 
-from utils.traffic_light_detector import TrafficLightDetector
+from ultralytics import YOLO
 
-from team_code_autopilot.fsm.autopilot_fsm import (
-    build_vehicle_fsm,
-    build_cargo_from_hdmap,
-    PlannerOutput,
-)
+from team_code_autopilot.utils.fsm.autopilot_fsm import build_vehicle_fsm
+
+def _hfov_to_fx(width_px: int, hfov_deg: float) -> float:
+    # Horizontal FoV → focal length (pixels)
+    return (width_px / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
+
+def _vfov_from_hfov(hfov_deg: float, w: int, h: int) -> float:
+    # Derive vertical FoV assuming square pixels
+    return math.degrees(2.0 * math.atan((h / w) * math.tan(math.radians(hfov_deg) / 2.0)))
+
+def _cam_intrinsics(w: int, h: int, hfov_deg: float):
+    fx = _hfov_to_fx(w, hfov_deg)
+    vfov = _vfov_from_hfov(hfov_deg, w, h)
+    fy = (h / 2.0) / math.tan(math.radians(vfov) / 2.0)
+    cx, cy = w / 2.0, h / 2.0
+    return fx, fy, cx, cy
+
+def _rpy_deg_to_RxRyRz(roll_deg, pitch_deg, yaw_deg):
+    # Roll (x), Pitch (y), Yaw (z) in degrees → rotation matrices
+    rx, ry, rz = map(math.radians, (roll_deg, pitch_deg, yaw_deg))
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+    Rx = np.array([[1, 0, 0],[0, cx, -sx],[0, sx, cx]], dtype=np.float32)
+    Ry = np.array([[cy, 0, sy],[0, 1, 0],[-sy, 0, cy]], dtype=np.float32)
+    Rz = np.array([[cz, -sz, 0],[sz, cz, 0],[0, 0, 1]], dtype=np.float32)
+    # Unreal/CARLA 순서: yaw(z) → pitch(y) → roll(x) 적용이 일반적
+    return Rx, Ry, Rz
+
+def _ego_to_cam_matrix(cam_pos, cam_rot_rpy_deg):
+    # 점을 ego→camera로 보내려면: p_cam = R_inv @ (p_ego - cam_pos)
+    Rx, Ry, Rz = _rpy_deg_to_RxRyRz(*cam_rot_rpy_deg)
+    R_ego_to_cam = (Rz @ Ry @ Rx)  # camera orientation relative to ego
+    R_inv = R_ego_to_cam.T         # inverse for coordinates transform
+    t = np.array(cam_pos, dtype=np.float32)
+    return R_inv, t
+
+def _project_points_to_image(points_ego_xyz, cam_pos, cam_rot_rpy_deg, w, h, hfov_deg):
+    """
+    points_ego_xyz: (N,3) in ego coords [x forward, y right, z up]
+    returns list of (u,v) ints inside image
+    """
+    fx, fy, cx, cy = _cam_intrinsics(w, h, hfov_deg)
+    R_inv, t = _ego_to_cam_matrix(cam_pos, cam_rot_rpy_deg)
+
+    uv_list = []
+    for p in points_ego_xyz:
+        p_rel = p - t                     # translate by camera position
+        p_cam = R_inv @ p_rel             # rotate into camera axes (X fwd, Y right, Z up)
+        X, Y, Z = float(p_cam[0]), float(p_cam[1]), float(p_cam[2])
+        if X <= 0.05:                     # behind/too close to the camera plane → skip
+            continue
+        u = int(cx + fx * (Y / X))        # pinhole: u = cx + fx*(Y/X)
+        v = int(cy - fy * (Z / X))        #            v = cy - fy*(Z/X)
+        if 0 <= u < w and 0 <= v < h:
+            uv_list.append((u, v))
+    return uv_list
 
 
 # =============================================================
@@ -34,8 +86,6 @@ def get_entry_point():
 # =============================================================
 class RoutePlanner(object):
     def __init__(self, min_distance: float, max_distance: float):
-        
-
         self.saved_route = deque()
         self.route = deque()
         self.min_distance = float(min_distance)
@@ -118,34 +168,13 @@ def clip(x, lo, hi):
 # =============================================================
 class MyAutopilot(autonomous_agent.AutonomousAgent):
     """
-    CARLA leaderboard agent wiring together:
-
-    - RoutePlanner for a global route in (north, east) space.
-    - HDMap for local lane geometry (used by the behavioural FSM).
-    - TrafficLightDetector (YOLO + LiDAR) for:
-        * whether a traffic light is red
-        * whether a stop sign is present
-        * distance to the relevant traffic light
-        * distance to the relevant stop sign
-    - autopilot_fsm.FSM as the ONLY component that decides DRIVE/STOP and
-      produces a PlannerOutput: (waypoint, target_speed, mode, reason).
-    - A PID-based low-level controller that:
-        * follows PlannerOutput.waypoint for steering, and
-        * tracks PlannerOutput.target_speed for throttle/brake.
-
-    my_autopilot.py only:
-        - sets up sensors, vehicle and HUD,
-        - runs LiDAR safety-box and YOLO-based detection,
-        - feeds those signals plus HDMap/ego state into autopilot_fsm.build_cargo_from_hdmap,
-        - runs the FSM and applies its PlannerOutput.
-
-    It NEVER touches or augments the FSM cargo dict and does NOT implement
-    its own behavioural logic or fallback path. Behaviour (drive vs stop)
-    is entirely decided in autopilot_fsm.py.
+    - Sensors: same placement as config, but we only *use* rgb_front (LiDAR는 사용).
+    - Follow global route via RoutePlanner (no learning).
+    - Emergency stop: if LiDAR detects obstacle within 5m in front corridor → full brake.
+    - Overlay control values on rgb_front and display via OpenCV.
     """
 
     def setup(self, path_to_conf_file, route_index=None):
-        print("[MyAutopilot] SETUP CALLED - HUD DEBUG VERSION")
         self.track = autonomous_agent.Track.SENSORS
         self.config_path = path_to_conf_file
         self.step = -1
@@ -182,10 +211,8 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
         self.safety_z_max = self.config.safety_z_max
 
         # HUD
-        self.show_window = True
-        print(f"[MyAutopilot] show_window = {self.show_window}")
+        self.show_window = bool(self.config.show_window)
         self.last_rgb = None
-
 
 
         # HDMap Utils
@@ -194,41 +221,43 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
         self._global_route_idx = 0          # index into global_plan_* for "current" route[0]
         self._route_len_prev = None         # track how many waypoints RoutePlanner has in its deque
 
-
-        # Traffic light & stop-sign detection using the shared module
-        self.traffic_light_detector = TrafficLightDetector(
-            model_path='./models/Traffic_GT.pt',  # same model as TL+SS agent
-            use_cuda=True,
-            config=self.config,
-        )
-
-        self.use_yolo = self.traffic_light_detector.use_yolo
-
-        # Traffic light detection state
-        self.traffic_lights_detected = []
-        self.yolo_update_interval = 1  # run YOLO every frame (or tune if needed)
-        self.yolo_counter = 0
-
+        # YOLO traffic light detection
+        self.use_yolo = False
+        self.yolo_model = None
+        try:
+            # Load trained traffic light model
+            model_path = './models/best.pt'
+            self.yolo_model = YOLO(model_path)
+            self.yolo_model.to('cuda' if self._is_cuda_available() else 'cpu')
+            
+            # Traffic light class mapping (from training)
+            self.traffic_light_class_names = {
+                0: 'Red',
+                1: 'Yellow',
+                2: 'Green',
+                3: 'Back'
+            }
+            self.use_yolo = True
+            print(f"[YOLO] Traffic light detection enabled with model: {model_path}")
+        except Exception as e:
+            print(f"[YOLO] Failed to initialize: {e}")
+            self.use_yolo = False
 
         self._prev_global_wp_world = None
         self._current_global_wp_world = None
 
+
+        # Traffic light detection state
+        self.traffic_lights_detected = []
+        self.yolo_update_interval = 3  # Run YOLO every 3 frames
+        self.yolo_counter = 0
+
+
+
         # ----------------------------------------------------------
         # FSM: build fsm
-        # ----------------------------------------------------------
-        self.fsm, self.fsm_cfg = build_vehicle_fsm(start_state="Drive")
+        self.fsm, _ = build_vehicle_fsm(start_state="Drive")
         self.fsm_state = self.fsm.state  # for optional HUD/logging
-
-
-        # Detour obstacle-relaxation bookkeeping
-        self._detour_enter_time_s = None          # timestamp when we entered Detour
-        self._detour_elapsed_s = 0.0              # local accumulator if timestamp is None
-        # Must match the default in build_cargo_from_hdmap
-        self._obstacle_check_base = 30.0          # base obstacle check distance in meters
-        self._detour_relax_factor = float(self.fsm_cfg.detour_relax_obstacle_factor)
-        self._detour_relax_duration_s = float(self.fsm_cfg.detour_relax_obstacle_duration_s)
-
-
 
     def _is_cuda_available(self):
         """Check if CUDA is available for GPU acceleration"""
@@ -238,18 +267,7 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
         except ImportError:
             return False
 
-    def set_global_plan(self, global_plan_gps, global_plan_world):
-        """
-        Called by the leaderboard to provide the full route.
 
-        - global_plan_gps: list of (gps_dict, command) where gps_dict has 'lat', 'lon'
-        - global_plan_world: list of (transform, command) in world coordinates
-
-        We store the GPS plan for the RoutePlanner and keep the world plan
-        only for potential debugging/visualization.
-        """
-        self._global_plan = global_plan_gps
-        self._global_plan_world = global_plan_world
 
 
     # ---------------------------------------------------------
@@ -338,12 +356,11 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
         lidar = input_data['lidar'][1][:, :3]
 
         # YOLO traffic light detection (every N frames)
-        if self.traffic_light_detector.use_yolo:
+        if self.use_yolo:
             self.yolo_counter += 1
             if self.yolo_counter >= self.yolo_update_interval:
-                self.traffic_lights_detected = self.traffic_light_detector.detect_traffic_lights(rgb)
+                self.traffic_lights_detected = self._detect_traffic_lights(rgb)
                 self.yolo_counter = 0
-
 
 
         return {
@@ -496,296 +513,291 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
         return False
 
     
-    def run_step(self, input_data, timestamp):
+    def _detect_traffic_lights(self, rgb_image):
         """
-        Main CARLA agent tick.
-
-        - Reads sensors via self.tick(...)
-        - Updates global route and HDMap (administrative)
-        - Computes safety box obstacle & high-level TL/stop-signf signals
-        - Builds cargo via autopilot_fsm.build_cargo_from_hdmap (ONLY place cargo is built)
-        - Steps FSM to get PlannerOutput (waypoint + target_speed + state/reason)
-        - Runs low-level PID control that follows the FSM waypoint & target speed
-
-        NOTE: This method does *not* construct or modify cargo on its own beyond
-        calling build_cargo_from_hdmap, and it does *not* compute any fallback
-        path. If the FSM does not provide a waypoint, we simply stop.
-        """
+        Detect traffic lights using trained YOLO model
         
+        Args:
+            rgb_image: (H, W, 3) numpy array in RGB format
+            
+        Returns:
+            list of dicts: [{'bbox': [x1,y1,x2,y2], 'conf': float, 'class': int, 'class_name': str}, ...]
+        """
+        if not self.use_yolo or self.yolo_model is None:
+            return []
+        
+        try:
+            # Run YOLO inference
+            results = self.yolo_model(rgb_image, verbose=False, imgsz=640)
+            
+            detections = []
+            for r in results:
+                boxes = r.boxes  # Detections object
+                
+                if boxes is None or len(boxes) == 0:
+                    continue
+                
+                for box in boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    
+                    # Filter by confidence threshold
+                    if conf > 0.3:
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        class_name = self.traffic_light_class_names.get(cls, 'Unknown')
+                        
+                        detections.append({
+                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                            'conf': conf,
+                            'class': cls,
+                            'class_name': class_name
+                        })
+            
+            return detections
+        
+        except Exception as e:
+            print(f"[YOLO] Detection error: {e}")
+            return []    
+
+    def run_step(self, input_data, timestamp):
         self.step += 1
         self._init_if_needed()
 
         data = self.tick(input_data)
 
-        # -----------------------------------------------------
-        # 1) Global route → next sparse waypoint
-        # -----------------------------------------------------
         # Position in meters (XY)
         pos_xy = self._get_position_xy(data['gps_ll'])
 
-        # Route planning: obtain next waypoint & command in (north, east)
+        # Route planning: obtain next waypoint & command
         route = self._route_planner.run_step(pos_xy)
-
-        # If for some reason there is no route left, stop safely
-        if len(route) == 0:
-            control = carla.VehicleControl()
-            control.steer = 0.0
-            control.throttle = 0.0
-            control.brake = 1.0
-            return control
-        
         next_wp, next_cmd = route[1] if len(route) > 1 else route[0]
 
-        # Convert RoutePlanner waypoint to world frame [x, y, z]
-        # Route planner: (north, east)
-        # World: x = east, y = -north
-        next_wp_world = np.array(
-            [float(next_wp[1]), -float(next_wp[0]), 0.0],
-            dtype=float,
-        )
+        # next_wp_world = np.array([float(next_wp[0]), float(next_wp[1]), 0.0], dtype=float)
+        next_wp_world = np.array([float(next_wp[1]), -float(next_wp[0]), 0.0], dtype=float)
 
 
-        # -----------------------------------------------------
-        # 2) Maintain "prev / current" global waypoints for HDMap
-        # -----------------------------------------------------
+        # 3) If this is the first time, just initialize
         if self._prev_global_wp_world is None or self._current_global_wp_world is None:
-            # First time initialization
             self._current_global_wp_world = next_wp_world
             self._prev_global_wp_world = next_wp_world
 
-        # If the sparse global waypoint changed, update the pair
+        # Check if next_wp changed compared to current_global_wp
         if not np.allclose(
             next_wp_world[:2],
             self._current_global_wp_world[:2],
-            atol=1e-3,
+            atol=1e-3
         ):
+            # Waypoint changed → shift current → prev, update current
             self._prev_global_wp_world = self._current_global_wp_world
             self._current_global_wp_world = next_wp_world
 
+        # # -----------------------------------------------------
+        # # HDMap debug: update masks + A* route (for visualization only)
+        # # -----------------------------------------------------
+        # if self.hdmap is not None:
+        #     # 1) Update HDMap internal state (ego pose, masks, etc.)
+        #     self.hdmap.tick()
+        #     self.hdmap.update_route_between_globals(self._prev_global_wp_world, self._current_global_wp_world)
+        # else:
+        #     print("[HDMap] Warning: HDMap utility not initialized; skipping HDMap debug update.")
 
         # -----------------------------------------------------
-        # 3) HDMap update (ego + local path), but *no* direct control from here
+        # 3) HDMap update + local centerline waypoint
         # -----------------------------------------------------
+        hd_wp_xy = None  # waypoint in [north, east]
+
         if self.hdmap is not None:
-            # Update HDMap internals (ego pose, masks, actor snapshots, etc.)
+            # Update HDMap internals (ego pose, masks, etc.)
             self.hdmap.tick()
 
             # Update local route between prev and current globals
-            # (autopilot_fsm.build_cargo_from_hdmap will call hdmap.get_next_waypoint())
             self.hdmap.update_route_between_globals(
                 self._prev_global_wp_world,
                 self._current_global_wp_world,
             )
+
+            # Get next mid-lane waypoint in world frame [x, y, z]
+            hd_wp_world = self.hdmap.get_next_waypoint()
+
+            if hd_wp_world is not None:
+                hd_wp_world = np.asarray(hd_wp_world, dtype=float)
+
+                # Convert world [x, y] back to "map" [north, east]
+                # world_x = east, world_y = -north → north = -world_y, east = world_x
+                hd_north = -hd_wp_world[1]
+                hd_east = hd_wp_world[0]
+                hd_wp_xy = (float(hd_north), float(hd_east))
         else:
             print(
                 "[HDMap] Warning: HDMap not initialized; "
-                "skipping HDMap update."
+                "skipping HDMap update and mid-lane waypoint."
             )
 
-
-
         # -----------------------------------------------------
-        # 4) LiDAR safety box → obstacle boolean - NOT USED RIGHT NOW -- must be changed so that lidar is projected onto hdmap
+        # 4) Choose waypoint for control (HDMap first, fallback: global route)
         # -----------------------------------------------------
-        # lidar = data['lidar']  # (N, 3): [x_forward, y_right, z_up] in ego frame
-
-        # x_fwd = lidar[:, 0]
-        # y_right = lidar[:, 1]
-        # z_up = lidar[:, 2]
-
-        # # Safety corridor in ego frame
-        # mask = (
-        #     (x_fwd > self.safety_x_min) & (x_fwd < self.safety_x_max) &
-        #     (np.abs(y_right) < self.safety_y_abs) &
-        #     (z_up > self.safety_z_min) & (z_up < self.safety_z_max)
-        # )
-        # obstacle = bool(np.any(mask))
-
-
-        # -----------------------------------------------------
-        # 5) Traffic light & stop-sign high-level signals
-        # -----------------------------------------------------
-        # traffic_lights = data.get("traffic_lights", [])
-
-        # tl_red = False
-        # stop_sign_present = False
-        # tl_distance = None
-        # stop_sign_distance = None
-
-        # if self.traffic_light_detector.use_yolo and len(traffic_lights) > 0:
-        #     tl_red, stop_sign_present, tl_distance, stop_sign_distance = (
-        #         self.traffic_light_detector.get_high_level_signals(
-        #             detections=traffic_lights,
-        #             lidar_points=data["lidar"],
-        #             rgb_image=self.last_rgb,
-        #             cam_pos=self.config.camera_pos,
-        #             cam_rot_rpy_deg=self.config.camera_rot_0,
-        #             lidar_pos=self.config.lidar_pos,
-        #             lidar_rot_rpy_deg=self.config.lidar_rot,
-        #         )
-        #     )
-
-        # NOTE:
-        # We no longer adjust self.target_speed directly based on traffic lights;
-        # instead, these 4 high-level signals go into the behavioural FSM via
-        # build_cargo_from_hdmap, and the FSM decides whether we are in DRIVE or STOP.
-
-        
-        # -----------------------------------------------------
-        # 6) FSM cargo building (HDMap + ego + perception)
-        # -----------------------------------------------------
-
-        # -----------------------------------------------------
-        # 6) FSM cargo building (HDMap + ego + perception)
-        # -----------------------------------------------------
-
-        # Choose dynamic obstacle lookahead distance for the FSM's obstacle_ahead flag.
-        base_obs_dist = getattr(self, "_obstacle_check_base", 30.0)
-        obstacle_distance = base_obs_dist
-
-        # If we are currently in Detour, keep the obstacle distance reduced
-        # for a fixed window after entering Detour, then snap back to normal.
-        if self.fsm.state == "Detour" and self._detour_enter_time_s is not None:
-
-            # Prefer the absolute leaderboard timestamp if available
-            if timestamp is not None:
-                dt_detour = float(timestamp) - float(self._detour_enter_time_s)
-            else:
-                # Fallback: integrate the elapsed time using the controller dt
-                self._detour_elapsed_s = float(getattr(self, "_detour_elapsed_s", 0.0)) + float(self.speed_pid.dt)
-                dt_detour = self._detour_elapsed_s
-
-            dur = float(self._detour_relax_duration_s)
-            relax_f = float(self._detour_relax_factor)
-
-            if dur <= 0.0 or dt_detour <= dur:
-                # During the configured duration (or if dur <= 0),
-                # use the fully relaxed distance.
-                obstacle_distance = base_obs_dist * relax_f
-            else:
-                # After the window, use the normal base distance again.
-                obstacle_distance = base_obs_dist
-
-
-
-
-        # All cargo construction is centralized in autopilot_fsm.build_cargo_from_hdmap.
-        # my_autopilot.py only supplies raw inputs (HDMap, ego, LiDAR, TL/SS signals).
-        cargo = build_cargo_from_hdmap(
-            hdmap_obj=self.hdmap,
-            ego_actor=getattr(self.hdmap, "ego", None) if self.hdmap is not None else None,
-            dt=float(self.speed_pid.dt),
-            t=float(timestamp) if timestamp is not None else None,
-            cruise_target=float(self.target_speed),
-            obstacle_distance=obstacle_distance,  
-
-            # just for testing
-            tl_red_from_vision=False,
-            tl_distance=None,
-            stop_sign_ahead_from_vision=False,
-            stop_sign_distance=None,
-
-            # tl_red_from_vision=tl_red,
-            # tl_distance=tl_distance,s
-            # stop_sign_ahead_from_vision=stop_sign_present,
-            # stop_sign_distance=stop_sign_distance,
-        )
-
-        # IMPORTANT: do *not* modify cargo after this point.
-        # All logic about "obstacle_ahead", "tl_red", "tl_near_stopline",
-        # "stop_sign_ahead", "ss_near_stopline" lives inside autopilot_fsm.py.
-
-
-        # -----------------------------------------------------
-        # 7) FSM step → state + high-level plan
-        # -----------------------------------------------------
-        prev_state = self.fsm_state
-        fsm_state, plan = self.fsm.step(cargo)
-        self.fsm_state = fsm_state                    # for HUD/logging
-        self.fsm_plan = plan                          # store whole PlannerOutput for HUD
-        self.fsm_reason = getattr(plan, "reason", "") # "obstacle", "red_light", ...
-
-        # Detour entry/exit timing for obstacle-distance relaxation
-        if fsm_state == "Detour":
-            # First time entering Detour in this episode
-            if prev_state != "Detour" or self._detour_enter_time_s is None:
-                self._detour_enter_time_s = float(timestamp) if timestamp is not None else 0.0
-                self._detour_elapsed_s = 0.0  # reset local elapsed-time counter
+        if hd_wp_xy is not None:
+            target_n, target_e = hd_wp_xy
         else:
-            # Left Detour → clear timers
-            self._detour_enter_time_s = None
-            self._detour_elapsed_s = 0.0
+            target_n, target_e = float(next_wp[0]), float(next_wp[1])
 
 
+
+        # # Transform next waypoint to ego local frame using compass
+        # dn = float(next_wp[0] - pos_xy[0])   # northing (lat)
+        # de = float(next_wp[1] - pos_xy[1])   # easting  (lon)
+
+        # Transform chosen waypoint to ego-local frame using compass
+        dn = float(target_n - pos_xy[0])  # northing delta
+        de = float(target_e - pos_xy[1])  # easting  delta
+
+        # --- CARLA compass: 0=N, +CW  →  yaw_math: 0=East, +CCW ---
+        bearing = float(data['compass'])     # radians
+        yaw = np.pi/2.0 - bearing            # world-yaw from +x(East), CCW
+
+        # --- world([east, north]) → ego([x_forward, y_left]) ---
+        c, s = np.cos(yaw), np.sin(yaw)
+        R = np.array([[ c,  s],
+                    [-s,  c]])
+        vec_local = R @ np.array([de, dn], dtype=np.float32)  # [x_forward, y_left]
+
+        v = float(data['speed'])  # current speed m/s
+
+
+        # -----------------------------------------------------
+        # LiDAR emergency stop (AABB in ego coordinates)
+        # CARLA LiDAR: x forward, y right, z up
+        # -----------------------------------------------------
+        lidar = data['lidar'][:, :3].copy()
+
+        # 1) 센서 yaw 보정 (lidar_rot[2] = -90° → 차량 전방 정렬)
+        yaw_deg = float(self.config.lidar_rot[2])
+        yaw_rad = math.radians(yaw_deg)
+        cy, sy = np.cos(-yaw_rad), np.sin(-yaw_rad)   # -yaw로 회전 보정
+        R_align = np.array([[cy, -sy],
+                            [sy,  cy]], dtype=np.float32)
+
+        xy_ego = lidar[:, :2] @ R_align.T
+        x_forward = xy_ego[:, 0]    # 차량 전방
+        y_right  = xy_ego[:, 1]    # 차량 오른쪽
+        z_up     = lidar[:, 2]     # 위쪽
+
+        # 2) 안전박스 조건 (앞으로 5m, 좌우 ±safety_y_abs, 높이 safety_z_min~safety_z_max)
+        mask = (
+            (x_forward > self.safety_x_min) & (x_forward < self.safety_x_max) &
+            (np.abs(y_right) < self.safety_y_abs) &
+            (z_up > self.safety_z_min) & (z_up < self.safety_z_max)
+        )
+        obstacle = bool(np.any(mask))
 
 
 
 
         # -----------------------------------------------------
-        # 8) Low-level control using FSM outputs
+        # Traffic Light Detection
         # -----------------------------------------------------
+
+        # Traffic light-based speed adjustment with color detection
+        traffic_lights = data.get('traffic_lights', [])
+        red_light_detected = False
+        yellow_light_detected = False
+
+        if len(traffic_lights) > 0 and self.use_yolo:
+            # Find largest (closest) traffic light
+            largest_tl = max(traffic_lights, key=lambda t: (t['bbox'][2] - t['bbox'][0]) * (t['bbox'][3] - t['bbox'][1]))
+            bbox_area = (largest_tl['bbox'][2] - largest_tl['bbox'][0]) * (largest_tl['bbox'][3] - largest_tl['bbox'][1])
+            class_name = largest_tl['class_name']
+            
+            # Only react if traffic light is close enough (large bbox)
+            if bbox_area > 5000:
+                if class_name == 'Red':
+                    red_light_detected = True
+                    self.target_speed = 0.0  # Full stop for red light
+                    print(f"[Traffic Light] RED - Stopping (area: {bbox_area:.0f})")
+                elif class_name == 'Yellow':
+                    yellow_light_detected = True
+                    self.target_speed = min(self.target_speed, 2.0)  # Slow down for yellow
+                    print(f"[Traffic Light] YELLOW - Slowing (area: {bbox_area:.0f})")
+                elif class_name == 'Green':
+                    # Green light - restore normal speed
+                    default_speed = float(self.config.target_speed)
+                    self.target_speed = default_speed
+                    print(f"[Traffic Light] GREEN - Go (area: {bbox_area:.0f})")
+        
+
+ 
+        # -----------------------------------------------------
+        # FSM step
+        # -----------------------------------------------------
+        # cargo = {
+        #     "obstacle": obstacle,
+        #     # Hook up traffic light later if you have it:
+        #     "red": False,
+        #     "dt": float(self.speed_pid.dt),
+        #     "speed": v,
+        #     "timestamp": float(timestamp) if timestamp is not None else float(self.step),
+        #     # You can add planner info if needed:
+        #     # "planner_cmd": str(next_cmd),
+        # }
+        # fsm_state, fsm_info = self.fsm.step(cargo)
+        # self.fsm_state = fsm_state  # for optional HUD/logging
+        
+        cargo = {
+            # Time
+            "dt": float(self.speed_pid.dt),
+            "t": float(timestamp) if timestamp is not None else None,
+
+            # Ego state
+            "speed": float(v),
+
+            # Gating signals (for now: only obstacle is wired;
+            # everything else is "no restriction" → always DRIVE)
+            "obstacle_ahead": bool(obstacle),
+            "obstacle_distance": None,          # not used yet
+
+            "tl_red": False,
+            "tl_near_stopline": False,
+
+            "stop_sign_ahead": False,
+            "ss_near_stopline": False,
+
+            # Desired free-flow speed in DRIVE
+            "cruise_target": float(self.target_speed),
+
+            # Optional: FSM can carry a waypoint if you want.
+            # For now we let the HDMap / earlier code pick the target
+            # and only use vec_local for lateral control.
+            "waypoint": None,
+        }
+
+        fsm_state, plan = self.fsm.step(cargo)
+        self.fsm_state = fsm_state  # for HUD/logging
+
+
         steer, throttle_cmd, brake_cmd = 0.0, 0.0, 0.0
 
-        # a) Waypoint for lateral control comes *only* from the FSM
-        has_valid_waypoint = bool(plan is not None and plan.waypoint is not None)
-        target_n = None
-        target_e = None
-        v = float(data['speed'])
-
-        if has_valid_waypoint:
-            wp_world = np.asarray(plan.waypoint, dtype=float).reshape(-1)
-            # HDMap world convention: x = East, y = -North
-            # Route planner convention: (north, east)
-            target_n = -wp_world[1]
-            target_e = wp_world[0]
-
-            # Transform FSM waypoint to ego-local frame using compass
-            dn = float(target_n - pos_xy[0])  # northing delta
-            de = float(target_e - pos_xy[1])  # easting  delta
-
-            bearing = float(data['compass'])      # rad, 0=N, +CW
-            yaw = np.pi / 2.0 - bearing           # world-yaw from +x(East), CCW
-            c, s = np.cos(yaw), np.sin(yaw)
-            R = np.array([[c,  s],
-                          [-s, c]], dtype=np.float32)
-            vec_local = R @ np.array([de, dn], dtype=np.float32)  # [x_forward, y_left]
-        else:
-            # No valid waypoint from FSM → we do NOT invent one.
-            # Keep vec_local at zero; we will only allow STOP behavior.
-            vec_local = np.array([0.0, 0.0], dtype=np.float32)
-
-        # b) Longitudinal target speed from FSM plan
-        plan_target_speed = (
-            float(plan.target_speed)
-            if (plan is not None and plan.target_speed is not None)
-            else float(self.target_speed)
-        )
-
-        # c) State-dependent control
-        if fsm_state in ("Drive", "Detour") and has_valid_waypoint:
-            # Lateral control: simple heading error from vec_local
+        if fsm_state == "Drive":
+            # -----------------------------------------------------
+            # Lateral control: simple pure-pursuit / heading error
+            # -----------------------------------------------------
             kx, ky = float(vec_local[0]), float(vec_local[1])
-            steer_angle = math.atan2(ky, max(1e-3, kx))  # [-pi, pi]
-            # CARLA: left turn is negative steer
+            steer_angle = math.atan2(ky, max(1e-3, kx))      # [-pi, pi]
+            # ky: +면 왼쪽 → CARLA steer는 왼쪽이 음수이므로 부호 반전
             steer = clip(-self.steer_gain * (steer_angle / (math.pi / 2.0)), -1.0, 1.0)
 
-            # Longitudinal PID towards FSM target speed
-            e_v = plan_target_speed - v
+            # -----------------------------------------------------
+            # Longitudinal PID for target speed
+            # -----------------------------------------------------
+            v = float(data['speed'])
+            e_v = self.target_speed - v
             throttle_cmd = self.speed_pid.step(e_v)
             brake_cmd = 0.0
 
-        elif (
-            fsm_state == "Stop"
-            or (fsm_state in ("Drive", "Detour") and not has_valid_waypoint)
-        ):
-            # STOP: explicit STOP state, or we refuse to drive without an FSM waypoint
-            steer = 0.0
+        elif fsm_state == "Stop":
             throttle_cmd = 0.0
             brake_cmd = 1.0
-
         else:
-            # Safe fallback for unknown states
-            steer = 0.0
+            # Safe fallback if a new/unknown state appears
             throttle_cmd = 0.0
             brake_cmd = 1.0
 
@@ -793,76 +805,88 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
 
 
         # -----------------------------------------------------
-        # 9) Compose VehicleControl
+        # Compose VehicleControl
         # -----------------------------------------------------
         control = carla.VehicleControl()
         control.steer = float(steer)
         control.throttle = float(throttle_cmd)
         control.brake = float(brake_cmd)
 
-
         # -----------------------------------------------------
-        # 10) On-screen HUD overlay via OpenCV
+        # On-screen HUD overlay via OpenCV
         # -----------------------------------------------------
         try:
             if self.show_window and self.last_rgb is not None:
                 hud = self.last_rgb.copy()
                 h, w, _ = hud.shape
 
-                # ----- Text HUD -----
-                fsm_state_str = getattr(self, "fsm_state", "N/A")
-                fsm_reason_str = getattr(self, "fsm_reason", "")
-                # tl_state_str = "RED" if tl_red else "green"
-                # stop_state_str = "STOP sign" if stop_sign_present else "no sign"
-                # tl_dist_str = f"{tl_distance:.1f}m" if tl_distance is not None else "N/A"
-                # ss_dist_str = f"{stop_sign_distance:.1f}m" if stop_sign_distance is not None else "N/A"
-                obstacle_ahead_fsm = bool(cargo.get("obstacle_ahead", False))
-
-
+                # ----- 텍스트 HUD -----
                 txts = [
                     f"step: {self.step}",
                     f"cmd: {getattr(next_cmd, 'name', str(next_cmd))}",
-                    f"speed: {v:.2f} m/s (target {plan_target_speed:.1f})",
+                    f"speed: {v:.2f} m/s (target {self.target_speed:.1f})",
                     f"steer: {control.steer:+.3f}",
                     f"throttle: {control.throttle:.3f}",
                     f"brake: {control.brake:.3f}",
-                    f"obstacle_ahead: {obstacle_ahead_fsm}",
-                    f"fsm_state: {fsm_state_str}",
-                    f"fsm_reason: {fsm_reason_str}",
-                    # f"tl_red: {tl_state_str} (dist {tl_dist_str})",
-                    # f"stop_sign: {stop_state_str} (dist {ss_dist_str})",
+                    f"front_obstacle: {obstacle}",
+                    f"fsm_state: {getattr(self, 'fsm_state', 'N/A')}",   # ★ NEW
                 ]
+                
+                pos_xy = self._get_position_xy(data['gps_ll'])
+                bearing = float(data['compass'])
+                yaw = math.pi/2.0 - bearing
+                c, s = math.cos(yaw), math.sin(yaw)
+                R_world_to_ego = np.array([[ c,  s],
+                                        [-s,  c]], dtype=np.float32)
 
+                dn_next = float(next_wp[0] - pos_xy[0])
+                de_next = float(next_wp[1] - pos_xy[1])
+                x_fwd_next, y_left_next = (R_world_to_ego @ np.array([de_next, dn_next], dtype=np.float32)).tolist()
 
-
-                # Local coordinates of the next sparse global waypoint (for debugging)
-                pos_xy_dbg = self._get_position_xy(data['gps_ll'])
-                bearing_dbg = float(data['compass'])
-                yaw_dbg = math.pi / 2.0 - bearing_dbg
-                c_dbg, s_dbg = math.cos(yaw_dbg), math.sin(yaw_dbg)
-                R_world_to_ego = np.array(
-                    [[c_dbg,  s_dbg],
-                     [-s_dbg, c_dbg]],
-                    dtype=np.float32,
-                )
-
-                dn_next = float(next_wp[0] - pos_xy_dbg[0])
-                de_next = float(next_wp[1] - pos_xy_dbg[1])
-                x_fwd_next, y_left_next = (
-                    R_world_to_ego @ np.array([de_next, dn_next], dtype=np.float32)
-                ).tolist()
-
-                # txts.append(
-                #     f"next_wp_local: x_fwd={x_fwd_next:.1f}m, y_left={y_left_next:.1f}m"
-                # )
-
+                txts.append(f"next_wp_local: x_fwd={x_fwd_next:.1f}m, y_left={y_left_next:.1f}m")
+                
                 y0 = 28
                 for i, t in enumerate(txts):
-                    cv2.putText(
-                        hud, t, (12, y0 + i * 26),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (0, 255, 0), 2, cv2.LINE_AA,
-                    )
+                    cv2.putText(hud, t, (12, y0 + i * 26),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+
+
+                # # ====== YOLO Traffic Light Bounding Boxes ======
+                # traffic_lights = data.get('traffic_lights', [])
+                # if self.use_yolo and len(traffic_lights) > 0:
+                #     for tl in traffic_lights:
+                #         x1, y1, x2, y2 = tl['bbox']
+                #         conf = tl['conf']
+                #         class_name = tl['class_name']
+                        
+                #         # Color-coded bounding boxes based on traffic light state
+                #         if class_name == 'Red':
+                #             color = (0, 0, 255)  # Red in BGR
+                #         elif class_name == 'Yellow':
+                #             color = (0, 255, 255)  # Yellow in BGR
+                #         elif class_name == 'Green':
+                #             color = (0, 255, 0)  # Green in BGR
+                #         else:  # Back (off)
+                #             color = (128, 128, 128)  # Gray in BGR
+                        
+                #         # Draw bounding box
+                #         cv2.rectangle(hud, (x1, y1), (x2, y2), color, 3)
+                        
+                #         # Draw label with confidence
+                #         label = f"{class_name}: {conf:.2f}"
+                #         label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                #         cv2.rectangle(hud, (x1, y1 - label_size[1] - 8), 
+                #                      (x1 + label_size[0], y1), color, -1)
+                #         cv2.putText(hud, label, (x1, y1 - 5),
+                #                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+                    
+                #     # Display detection count
+                #     tl_count_text = f"Traffic Lights: {len(traffic_lights)}"
+                #     cv2.putText(hud, tl_count_text, (12, h - 20),
+                #                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+
+
+
 
 
                 # ====== Waypoints → Camera Projection (next 5) ======
@@ -924,24 +948,20 @@ class MyAutopilot(autonomous_agent.AutonomousAgent):
                         color = (0, 0, 255) if j == 0 else (255, 0, 0)
                         cv2.circle(hud, (u, v), 6, color, -1)
 
-                hud = cv2.resize(hud, (int(w * 0.5), int(h * 0.5)), interpolation=cv2.INTER_LINEAR)
+                hud = cv2.resize(hud, (w * 2, h * 2), interpolation=cv2.INTER_LINEAR)
+                # hud = cv2.resize(hud, (w, h), interpolation=cv2.INTER_LINEAR)
+
                 cv2.imshow('rgb_front', hud)
                 cv2.waitKey(1)
 
         except Exception:
             # If running headless, just ignore GUI errors
-            print("[MyAutopilot][HUD] Exception in HUD block:")
+            pass
 
         return control
-
-
-
 
     def destroy(self):
         try:
             cv2.destroyAllWindows()
         except Exception:
             pass
-
-
-

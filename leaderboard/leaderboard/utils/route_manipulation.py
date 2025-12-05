@@ -129,7 +129,7 @@ def downsample_route(route, sample_factor):
     return ids_to_sample
 
 
-def interpolate_trajectory(world, waypoints_trajectory, hop_resolution=1.0):
+def interpolate_trajectory(world, waypoints_trajectory, hop_resolution=10.0):
     """
     Given some raw keypoints interpolate a full dense trajectory to be used by the user.
     returns the full interpolated route both in GPS coordinates and also in its original form.

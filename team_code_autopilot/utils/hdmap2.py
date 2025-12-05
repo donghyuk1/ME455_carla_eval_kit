@@ -17,9 +17,6 @@ import team_code_autopilot.utils.test_xodr as tx
 import team_code_autopilot.utils.carla_vehicle_annotator as cva
 import team_code_autopilot.utils.gemap_annotator as ga
 
-from scipy.spatial import cKDTree
-
-
 # ---------- Camera setups (same as data_label_generate_ours.py) ----------
 CAMERA_SETUPS = {
     'RGB_1': {
@@ -72,7 +69,6 @@ class HDMap:
         self.is_visualize = bool(is_visualize)
         # self.use_masked_points = False  # whether to filter hdmap points by frustum masks
 
-
         if self.is_visualize:
             cv2.namedWindow("HDMap_Debug", cv2.WINDOW_NORMAL)
             cv2.resizeWindow("HDMap_Debug", 800, 800)
@@ -115,9 +111,6 @@ class HDMap:
         self.divider_mask_clustered = None
         self.bound_mask_clustered = None
         self.cross_mask_clustered = None
-
-        # new variable for mapping
-        self._center_map_clustered = None
 
         # Snapshots of actors (last tick)
         self._ego_snap = None
@@ -304,8 +297,6 @@ class HDMap:
         if pts.size == 0:
             return pts  # empty array
 
-        return [pts[mask][idx_array[mask]==i] for i in np.unique(idx_array[mask]) ]
-
         # If we don't have index information, just apply mask and return flat points
         if idx_array is None:
             if mask is not None:
@@ -327,147 +318,152 @@ class HDMap:
         return grouped
 
 
+    # def _find_closest_center_cluster(
+    #     self,
+    #     location_xy: np.ndarray,
+    # ):
+    #     """
+    #     Given a 2D world location (x, y), find the closest centerline cluster.
+
+    #     Uses self.center_mask_clustered, which is a list of (Mi, 3) arrays
+    #     returned by _group_points_by_id(...).
+
+    #     Args:
+    #         location_xy: np.ndarray shape (2,) or (3,), world-frame (x, y [, z])
+
+    #     Returns:
+    #         (best_idx, best_cluster_pts, best_dist)
+
+    #         best_idx:
+    #             - index into self.center_mask_clustered
+    #             - -1 if not found / no clusters
+    #         best_cluster_pts:
+    #             - (Mi, 3) np.ndarray of the chosen cluster
+    #             - None if no cluster found
+    #         best_dist:
+    #             - minimal Euclidean distance [m] from location_xy to any point in that cluster
+    #             - float("inf") if no cluster found
+    #     """
+    #     # Normalize input location to [x, y]
+    #     loc = np.asarray(location_xy, dtype=float).reshape(-1)
+    #     if loc.size >= 2:
+    #         loc_xy = loc[:2]
+    #     else:
+    #         raise ValueError("location_xy must have at least 2 elements (x, y).")
+
+    #     # Make sure clusters exist
+    #     clusters = getattr(self, "center_mask_clustered", None)
+    #     if clusters is None or len(clusters) == 0:
+    #         print("[HDMap] Warning: center_mask_clustered is empty; cannot find closest cluster.")
+    #         return -1, None, float("inf")
+
+    #     best_idx = -1
+    #     best_d2 = float("inf")
+    #     best_cluster = None
+
+    #     for i, seg in enumerate(clusters):
+    #         if seg is None or len(seg) == 0:
+    #             continue
+
+    #         seg = np.asarray(seg)
+    #         # seg is (Mi, 3) -> take XY
+    #         seg_xy = seg[:, :2]
+
+    #         diff = seg_xy - loc_xy[None, :]
+    #         d2 = np.einsum("ij,ij->i", diff, diff)
+    #         local_min = float(d2.min())
+
+    #         if local_min < best_d2:
+    #             best_d2 = local_min
+    #             best_idx = i
+    #             best_cluster = seg
+
+    #     if best_idx < 0:
+    #         return -1, None, float("inf")
+
+    #     return best_idx, best_cluster, math.sqrt(best_d2)
     def _find_closest_center_cluster(
         self,
         wp_xy: np.ndarray,
         ego_xy: np.ndarray,
     ):
         """
-        Find the centerline cluster closest to BOTH:
-        - waypoint wp_xy
-        - ego position ego_xy
+        Given a waypoint and the ego position (both in world XY),
+        find the centerline cluster that is jointly close to BOTH.
 
-        Uses MEAN squared distance instead of MIN squared distance.
+        Uses self.center_mask_clustered, which is a list of (Mi, 3) arrays.
+
+        Args:
+            wp_xy:  np.ndarray shape (2,) or (3,), world-frame (x, y [, z])
+            ego_xy: np.ndarray shape (2,) or (3,), world-frame (x, y [, z])
 
         Returns:
-            best_idx, best_cluster_pts, dist_wp_mean, dist_ego_mean
+            (best_idx, best_cluster_pts, dist_wp, dist_ego)
+
+            best_idx:
+                - index into self.center_mask_clustered
+                - -1 if not found / no clusters
+            best_cluster_pts:
+                - (Mi, 3) np.ndarray of the chosen cluster
+                - None if no cluster found
+            dist_wp:
+                - minimal Euclidean distance [m] from wp_xy to any point in that cluster
+            dist_ego:
+                - minimal Euclidean distance [m] from ego_xy to any point in that cluster
         """
 
-        # Normalize inputs
+        # Normalize inputs to [x, y]
         wp = np.asarray(wp_xy, dtype=float).reshape(-1)
         ego = np.asarray(ego_xy, dtype=float).reshape(-1)
 
         if wp.size < 2 or ego.size < 2:
-            raise ValueError("wp_xy and ego_xy must contain at least 2 elements (x,y).")
+            raise ValueError("wp_xy and ego_xy must have at least 2 elements (x, y).")
 
         wp_xy = wp[:2]
         ego_xy = ego[:2]
 
         clusters = getattr(self, "center_mask_clustered", None)
         if clusters is None or len(clusters) == 0:
+            print("[HDMap] Warning: center_mask_clustered is empty; cannot find closest cluster.")
             return -1, None, float("inf"), float("inf")
 
         best_idx = -1
         best_cluster = None
-        best_mean_wp = float("inf")
-        best_mean_ego = float("inf")
-        best_score = float("-inf")
+        best_d2_wp = float("inf")
+        best_d2_ego = float("inf")
+        best_score = float("inf")  # score = max(d2_wp, d2_ego)
 
         for i, seg in enumerate(clusters):
             if seg is None or len(seg) == 0:
                 continue
 
             seg = np.asarray(seg, dtype=float)
-            seg_xy = seg[:, :2]   # (Mi, 2)
+            seg_xy = seg[:, :2]  # (Mi, 2)
 
-            # ------------------------------
-            # Compute mean squared distance
-            # ------------------------------
-            # WP
+            # Distances to waypoint
             diff_wp = seg_xy - wp_xy[None, :]
-            d2_wp = np.einsum("ij,ij->i", diff_wp, diff_wp)
-            mean_wp = float(d2_wp.mean())  # <------ changed from min() to mean()
+            d2_wp_all = np.einsum("ij,ij->i", diff_wp, diff_wp)
+            local_min_wp = float(d2_wp_all.min())
 
-            # EGO
+            # Distances to ego
             diff_ego = seg_xy - ego_xy[None, :]
-            d2_ego = np.einsum("ij,ij->i", diff_ego, diff_ego)
-            mean_ego = float(d2_ego.mean())  # <----- changed from min() to mean()
+            d2_ego_all = np.einsum("ij,ij->i", diff_ego, diff_ego)
+            local_min_ego = float(d2_ego_all.min())
 
-            # Combined score prioritizes clusters close to BOTH
-            score = - 2* mean_wp - mean_ego #max(mean_wp, mean_ego)
-
-            if score > best_score:
-                best_score  = score
-                best_idx    = i
-                best_cluster = seg
-                best_mean_wp = mean_wp
-                best_mean_ego = mean_ego
-
-        if best_idx < 0:
-            return -1, None, float("inf"), float("inf")
-
-        # Return RMS distances (sqrt of mean squared dist)
-        return best_idx, best_cluster, math.sqrt(best_mean_wp), math.sqrt(best_mean_ego) 
-
- 
-    def _find_closest_mapped_center_cluster(
-        self,
-        wp_xy: np.ndarray,
-        ego_xy: np.ndarray,
-    ) -> Tuple[int, Optional[np.ndarray], float, float]:
-        """
-        Find the centerline cluster in the *mapped* clusters (self._center_map_clustered)
-        that is jointly close to BOTH the waypoint and the ego position.
-
-        Returns:
-            (best_idx, best_cluster_pts, dist_wp, dist_ego)
-
-            best_idx:
-                - index into self._center_map_clustered
-                - -1 if none found / no clusters
-            best_cluster_pts:
-                - (Mi, 3) np.ndarray of the chosen cluster
-                - None if no cluster found
-            dist_wp:
-                - mean Euclidean distance [m] from wp_xy to points in that cluster
-            dist_ego:
-                - mean Euclidean distance [m] from ego_xy to points in that cluster
-        """
-
-        # Ensure we actually have a mapped cluster list
-        if not hasattr(self, "_center_map_clustered") or self._center_map_clustered is None:
-            return -1, None, float("inf"), float("inf")
-
-        clusters = self._center_map_clustered
-        if len(clusters) == 0:
-            return -1, None, float("inf"), float("inf")
-
-        wp_xy  = np.asarray(wp_xy, dtype=float).reshape(2)
-        ego_xy = np.asarray(ego_xy, dtype=float).reshape(2)
-
-        best_idx = -1
-        best_cluster = None
-        best_dist_wp = float("inf")
-        best_dist_ego = float("inf")
-        best_score = float("inf")
-
-        for idx, cl in enumerate(clusters):
-            if cl is None or len(cl) == 0:
-                continue
-
-            pts_xy = cl[:, :2]  # (Mi, 2)
-
-            # Mean distance to waypoint
-            d_wp = np.linalg.norm(pts_xy - wp_xy[None, :], axis=1).min()
-
-            # Mean distance to ego
-            d_ego = np.linalg.norm(pts_xy - ego_xy[None, :], axis=1).min()
-
-            # Combined score (you can tweak this weighting)
-            score = 0.5 * (d_wp + d_ego)
+            # Combined score: “good for both waypoint and ego”
+            score = max(local_min_wp, local_min_ego)
 
             if score < best_score:
                 best_score = score
-                best_idx = idx
-                best_cluster = cl
-                best_dist_wp = d_wp
-                best_dist_ego = d_ego
+                best_idx = i
+                best_cluster = seg
+                best_d2_wp = local_min_wp
+                best_d2_ego = local_min_ego
 
         if best_idx < 0:
             return -1, None, float("inf"), float("inf")
 
-        return best_idx, best_cluster, best_dist_wp, best_dist_ego
-
+        return best_idx, best_cluster, math.sqrt(best_d2_wp), math.sqrt(best_d2_ego)
 
     def _find_neighbor_lanes(
         self,
@@ -715,15 +711,6 @@ class HDMap:
         self.cross_mask = cross_mask
 
 
-        center_idx, divider_idx, bound_idx, cross_idx = self.idxes
-
-        self.center_mask_clustered  = self._group_points_by_id(self.center_pts,  center_idx,  self.center_mask)
-        self.divider_mask_clustered = self._group_points_by_id(self.divider_pts, divider_idx, self.divider_mask)
-        self.bound_mask_clustered   = self._group_points_by_id(self.bound_pts,   bound_idx,   self.bound_mask)
-        self.cross_mask_clustered   = self._group_points_by_id(self.cross_pts,   cross_idx,   self.cross_mask)
-
-
-
         # update ego information
         ego_tf = ego_snap.get_transform()
         ego_loc = ego_tf.location
@@ -736,201 +723,22 @@ class HDMap:
         self._ego_xy = self.ego_xy.copy()
         self._ego_yaw = self.ego_yaw
 
-        # self._filter_center_clusters_by_heading(max_angle_deg=150.0)
 
-        self._update_centerline_mapping()
-
-
-
-    def _update_centerline_mapping(
-        self,
-        cluster_dist_thresh: float = 2.0,
-        max_range_from_ego: float = 100.0,
-        min_cluster_length: int = 8,
-    ) -> None:
-        """
-        Maintain a global list of *clusters* (each an array of (Mi, 3) points).
-
-        - Only keep clusters whose center is within `max_range_from_ego` [m] of ego.
-        - Treat two clusters as duplicates if their XY means (cluster centers)
-        are within `cluster_dist_thresh` meters of each other.
-
-        Internal state:
-        - self._center_map_clustered : List[np.ndarray], each (Mi, 3)
-        - self._center_map_centers   : (K, 2) array of cluster centers (x, y)
-        - self._center_map_kdtree    : KD-tree over centers (for fast lookup)
-        """
-
-        # Nothing to add if no clustered points this frame
-        if not hasattr(self, "center_mask_clustered") or self.center_mask_clustered is None:
+    def _update_waypoint_cursor(self):
+        """Maintain a simple forward-moving cursor along global sparse waypoints."""
+        if self._ego_snap is None or len(self.global_waypoints) == 0:
             return
 
-        # Get ego position in XY (if available)
-        ego_xy = getattr(self, "ego_xy", None)
-        if ego_xy is not None:
-            ego_xy = np.asarray(ego_xy, dtype=float).reshape(2)
+        ego_loc = np.array([self._ego_snap["location"]["x"], self._ego_snap["location"]["y"]], dtype=float)
+        idx = self._closest_global_idx_ahead(ego_loc, min_forward_dot=0.1)
 
-        # Initialize mapping structures if needed
-        if not hasattr(self, "_center_map_clustered") or self._center_map_clustered is None:
-            self._center_map_clustered = []
-
-        if not hasattr(self, "_center_map_centers") or self._center_map_centers is None:
-            self._center_map_centers = np.zeros((0, 2), dtype=float)
-            self._center_map_kdtree = None
-
-        # ------------------------------------------------------------------
-        # 1) PRUNE existing map: drop clusters beyond max_range_from_ego
-        # ------------------------------------------------------------------
-        if ego_xy is not None and self._center_map_centers.shape[0] > 0:
-            dists_to_ego = np.linalg.norm(self._center_map_centers - ego_xy[None, :], axis=1)
-            mask_keep = dists_to_ego <= max_range_from_ego
-
-            if not np.all(mask_keep):
-                # Filter centers
-                self._center_map_centers = self._center_map_centers[mask_keep]
-
-                # Filter clustered list with the same mask
-                self._center_map_clustered = [
-                    cl for cl, keep in zip(self._center_map_clustered, mask_keep) if keep
-                ]
-
-                # Rebuild / clear KD-tree depending on remaining count
-                if self._center_map_centers.shape[0] > 0:
-                    self._center_map_kdtree = cKDTree(self._center_map_centers)
-                else:
-                    self._center_map_kdtree = None
-
-        # ------------------------------------------------------------------
-        # 2) ADD new clusters from current view (within 100 m of ego)
-        # ------------------------------------------------------------------
-        new_clusters = []
-        new_centers = []
-
-        for cluster in self.center_mask_clustered:
-            if cluster is None or len(cluster) < min_cluster_length:
-                continue
-
-            xy = cluster[:, :2]                  # (Mi, 2)
-            center_xy = xy.mean(axis=0)          # (2,)
-
-            # If we know ego position: reject clusters far from ego
-            if ego_xy is not None:
-                dist_ego = np.linalg.norm(center_xy - ego_xy)
-                if dist_ego > max_range_from_ego:
-                    # Too far from ego → do not store this cluster
-                    continue
-
-            # If no stored clusters (or KD-tree missing), everything within range is new
-            if self._center_map_centers.shape[0] == 0 or self._center_map_kdtree is None:
-                new_clusters.append(cluster.copy())
-                new_centers.append(center_xy)
-                continue
-
-            # Check against existing clusters via KD-tree
-            dist, idx = self._center_map_kdtree.query(center_xy, k=1)
-
-            if dist > cluster_dist_thresh:
-                # Far enough from existing cluster → treat as new
-                new_clusters.append(cluster.copy())
-                new_centers.append(center_xy)
-            else:
-                # Close to an existing stored cluster → treat as duplicate, skip
-                continue
-
-        # Nothing new this tick
-        if not new_clusters:
-            return
-
-        # Append new clusters and centers
-        self._center_map_clustered.extend(new_clusters)
-        self._center_map_centers = np.vstack([self._center_map_centers,
-                                            np.vstack(new_centers)])
-
-        # Rebuild KD-tree over centers
-        self._center_map_kdtree = cKDTree(self._center_map_centers)
-
-
-    def _filter_center_clusters_by_heading(
-        self,
-        max_angle_deg: float = 120.0,
-    ) -> None:
-        """
-        Reject outlier centerline clusters whose direction differs too much
-        from the *route direction*, defined as (next waypoint - ego position).
-
-        - Cluster direction = (end_point - start_point)
-        - Reference direction = (next_wp_world[:2] - ego_xy)
-
-        Any cluster whose angle from the reference vector exceeds
-        `max_angle_deg` is rejected (likely opposite-flow lane).
-        """
-
-        # Ensure clusters exist
-        clusters = getattr(self, "center_mask_clustered", None)
-        if clusters is None or len(clusters) == 0:
-            return
-        
-        # Need ego position
-        if not hasattr(self, "ego_xy") or self.ego_xy is None:
-            return
-
-        ego_xy = np.asarray(self.ego_xy, dtype=float).reshape(2)
-
-        # Need next waypoint
-        if not hasattr(self, "_next_wp_world") or self._next_wp_world is None:
-            return
-
-        next_wp = np.asarray(self._next_wp_world, dtype=float).reshape(-1)
-        if next_wp.size < 2:
-            return
-
-        next_xy = next_wp[:2]
-
-        # Build reference route direction
-        ref_vec = next_xy - ego_xy
-        ref_norm = np.linalg.norm(ref_vec)
-        if ref_norm < 1e-3:
-            # Cannot define direction
-            return
-
-        ref_dir = ref_vec / ref_norm
-
-        # cos threshold for angle > max_angle_deg
-        cos_thresh = math.cos(math.radians(max_angle_deg))
-
-        filtered = []
-        
-
-        for pts in clusters:
-            pts = np.asarray(pts, dtype=float)
-            if pts.shape[0] < 2:
-                # Too small, keep it
-                filtered.append(pts)
-                continue
-
-            start_xy = pts[0, :2]
-            end_xy   = pts[-1, :2]
-            delta    = end_xy - start_xy
-            print(start_xy, end_xy)
-
-            norm = np.linalg.norm(delta)
-            if norm < 1e-3:
-                filtered.append(pts)
-                continue
-
-            dir_vec = delta / norm
-
-            # Compute angle between cluster direction and route direction
-            cos_theta = float(np.dot(ref_dir, dir_vec))
-            cos_theta = max(-1.0, min(1.0, cos_theta))
-
-            if cos_theta < cos_thresh:
-                # Opposite direction or unusable → reject
-                continue
-
-            filtered.append(pts)
-
-        self.center_mask_clustered = filtered
+        # Advance cursor toward idx but never go backward (assumes roughly forward progress)
+        if idx >= self._wp_idx:
+            self._wp_idx = idx
+        else:
+            # if wrap-around or respawn, allow reset if it's "much" earlier
+            if (self._wp_idx - idx) > 20:
+                self._wp_idx = idx
 
 
     def _make_hdmap_image_ego(
@@ -1235,18 +1043,25 @@ class HDMap:
         if self._ego_snap is None:
             return
 
+        center_idx, divider_idx, bound_idx, cross_idx = self.idxes
 
-        path_pts = self._current_lane_path # if self._current_path_valid else None
+        self.center_mask_clustered  = self._group_points_by_id(self.center_pts,  center_idx,  self.center_mask)
+        self.divider_mask_clustered = self._group_points_by_id(self.divider_pts, divider_idx, self.divider_mask)
+        self.bound_mask_clustered   = self._group_points_by_id(self.bound_pts,   bound_idx,   self.bound_mask)
+        self.cross_mask_clustered   = self._group_points_by_id(self.cross_pts,   cross_idx,   self.cross_mask)
+
+
+        path_pts = self._current_lane_path if self._current_path_valid else None
         
 
         current_lane_pts = self._current_lane_path if self._current_path_valid else None
         left_lane_pts = self._left_lane_path if self._left_path_valid else None
         right_lane_pts = self._right_lane_path if self._right_path_valid else None
 
-    
+
         # Delegate image creation to modular helper (same as hdmap_vis.py)
         img = self._make_hdmap_image_ego(
-            center_pts=self._center_map_clustered, #self.center_mask_clustered,
+            center_pts=self.center_mask_clustered,
             divider_pts=self.divider_mask_clustered,
             bound_pts=self.bound_mask_clustered,
             cross_pts=self.cross_mask_clustered,
@@ -1410,30 +1225,11 @@ class HDMap:
 
 
 
-
-    # # tick will be updated to include hdmap prediction data, traffic lights, ego_pose
-    # self.prediction_data = {
-    #     'map_elements' : {'center_lines': [np.array(20, 3), ], 
-    #                       'boundary' : [np.array(20, 3), ]},
-    #     'objects' : {'boxes_3d': np.array(N, 7), 'labels_': np.array(N,)},
-    #     'traffic_lights': {'Red':[(x, y, z), ], 'Yellow':[(x, y, z), ], 'Green':[(x, y, z), ], 'Sign':[(x, y, z), ]},
-    #     'meta': {'num_map_elements':int},
-    #     'timestamp': timestamp,
-    #     'ego_pose': {'x': float(pos_xy[0]),
-    #                  'y': float(pos_xy[1]),
-    #                  'z': 0.0,
-    #                  'pitch': 0.0,
-    #                  'yaw': float(data['compass'])
-    #                  },
-    # }
-
-
-
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
 
-    def tick(self, prediction_data = None,):
+    def tick(self):
         """Call this every control cycle to update masks and actor states."""
         self._update_hdmap_info()
         # self._update_waypoint_cursor()
@@ -1479,6 +1275,7 @@ class HDMap:
                 _find_closest_center_cluster(next_wp_xy, ego_xy)
             and picks the cluster that is closer to ego_xy.
         """
+        import numpy as np
 
         # 1) basic checks
         if next_wp_world is None:
@@ -1539,20 +1336,18 @@ class HDMap:
         # --------------------------------------------------
         # 2) Find best cluster for (curr_wp, ego) and (next_wp, ego)
         # --------------------------------------------------
-
-        curr_idx, curr_cluster_pts, dist_curr_wp, dist_curr_ego = self._find_closest_mapped_center_cluster(
+        curr_idx, curr_cluster_pts, dist_curr_wp, dist_curr_ego = self._find_closest_center_cluster(
             curr_wp_world[:2],
             ego_xy,
         )
 
-        next_idx, next_cluster_pts, dist_next_wp, dist_next_ego = self._find_closest_mapped_center_cluster(
+        next_idx, next_cluster_pts, dist_next_wp, dist_next_ego = self._find_closest_center_cluster(
             next_wp_world[:2],
             ego_xy,
         )
 
         curr_valid = (curr_idx >= 0 and curr_cluster_pts is not None and len(curr_cluster_pts) > 0)
         next_valid = (next_idx >= 0 and next_cluster_pts is not None and len(next_cluster_pts) > 0)
-
 
         # --------------------------------------------------
         # 3) Choose which cluster to use
@@ -1602,11 +1397,11 @@ class HDMap:
         # --------------------------------------------------
         # Require both waypoint and ego to be reasonably close to this cluster
         self._projection_ok = (
-            (base_dist_wp  <= self._projection_max_dist) or
+            (base_dist_wp  <= self._projection_max_dist) and
             (base_dist_ego <= self._projection_max_dist)
         )
 
-        self._current_lane_path = np.asarray(base_pts, dtype=float).copy() if self._projection_ok else None
+        self._current_lane_path = np.asarray(base_pts, dtype=float).copy()
         self._current_path_valid = self._projection_ok
 
         # For backward compatibility:
@@ -2005,6 +1800,121 @@ class HDMap:
                 self._obstacle_in_front = True
                 break
         return self._obstacle_in_front
+
+    # def is_obstacle_in_front(
+    #     self,
+    #     distance: float = 10.0,
+    #     fov_deg: float = 30.0,
+    #     margin: float = 0.5,
+    # ) -> bool:
+    #     """
+    #     Check if there is any obstacle (vehicle bbox) in front of the ego
+    #     along the *current lane path* within a given look-ahead distance
+    #     and field-of-view.
+
+    #     Uses:
+    #     - self._current_lane_path: (N, 3) centerline points in world XY
+    #     - self._current_path_valid: bool
+    #     - self._ego_xy: (2,) ego position in world XY
+    #     - self._ego_yaw: float, ego yaw in radians (0=+x, CCW)
+    #     - self._obstacle_bboxes: list of bbox dicts (ga.get_vehicle_bbox-style)
+
+    #     Returns:
+    #     True if any bbox overlaps the forward portion of the lane path.
+    #     """
+    #     # # ------------------------------------------------------------
+    #     # # 1) Sanity checks: need a valid lane path and ego pose
+    #     # # ------------------------------------------------------------
+    #     # if not getattr(self, "_current_path_valid", False):
+    #     #     # No lane → we can't reason about "ahead"; be conservative or just False
+    #     #     return False
+
+    #     # if not hasattr(self, "_current_lane_path") or self._current_lane_path is None:
+    #     #     return False
+
+    #     # lane = np.asarray(self._current_lane_path, dtype=float)
+    #     # if lane.ndim != 2 or lane.shape[0] == 0:
+    #     #     return False
+
+    #     # if not hasattr(self, "_ego_xy") or not hasattr(self, "_ego_yaw"):
+    #     #     # ego pose not set; you should fill these in tick()
+    #     #     return False
+
+    #     # ego_xy = np.asarray(self._ego_xy, dtype=float).reshape(2)
+    #     # yaw = float(self._ego_yaw)
+
+    #     # # ------------------------------------------------------------
+    #     # # 2) Extract the portion of the lane *ahead* of ego
+    #     # #    within 'distance' and 'fov_deg'
+    #     # # ------------------------------------------------------------
+    #     # lane_xy = lane[:, :2]  # (N, 2)
+
+    #     # # Find closest lane point to ego → anchor index
+    #     # diff = lane_xy - ego_xy[None, :]
+    #     # d2 = np.einsum("ij,ij->i", diff, diff)
+    #     # i0 = int(np.argmin(d2))
+
+    #     # # Forward direction unit vector in world XY
+    #     # fwd = np.array([math.cos(yaw), math.sin(yaw)], dtype=float)
+
+    #     # # Collect lane points ahead of ego, capped by arc-length and FOV
+    #     # forward_pts = []
+    #     # accum_dist = 0.0
+    #     # last_xy = lane_xy[i0]
+
+    #     # half_fov = float(fov_deg) * 0.5 * math.pi / 180.0  # radians
+
+    #     # for k in range(i0, lane_xy.shape[0]):
+    #     #     p_xy = lane_xy[k]
+
+    #     #     # Vector from ego to this point
+    #     #     v = p_xy - ego_xy
+    #     #     norm_v = np.linalg.norm(v)
+    #     #     if norm_v < 1e-3:
+    #     #         # basically at ego position; include and continue
+    #     #         angle_ok = True
+    #     #     else:
+    #     #         # angle between forward and v
+    #     #         cosang = float(np.dot(v / norm_v, fwd))
+    #     #         cosang = max(-1.0, min(1.0, cosang))
+    #     #         ang = math.acos(cosang)
+    #     #         angle_ok = (ang <= half_fov)
+
+    #     #     if not angle_ok:
+    #     #         continue  # outside FOV → skip
+
+    #     #     # Accumulate arc-length *along the lane*
+    #     #     if k > i0:
+    #     #         ds = float(np.linalg.norm(p_xy - last_xy))
+    #     #         accum_dist += ds
+    #     #         last_xy = p_xy
+
+    #     #     if accum_dist > distance:
+    #     #         break
+
+    #     #     forward_pts.append(lane[k])
+
+    #     # if len(forward_pts) == 0:
+    #     #     # No lane segment ahead in FOV/distance
+    #     #     return False
+
+    #     # route_slice = np.vstack(forward_pts)  # (M, 3)
+    #     route_slice = self._current_lane_path
+
+    #     # ------------------------------------------------------------
+    #     # 3) Check each obstacle bbox for overlap with the route_slice
+    #     # ------------------------------------------------------------
+    #     bboxes = getattr(self, "_obstacle_bboxes", None)
+    #     if not bboxes:
+    #         return False  # no obstacles known
+
+    #     for bbox in bboxes:
+    #         if bbox is None:
+    #             continue
+    #         if self._route_overlaps_bbox(route_slice, bbox, margin=margin):
+    #             return True
+
+    #     return False
 
 
     def is_nextlane_free(self, distance: float = 20.0, clearance: float = 3.0) -> bool:
